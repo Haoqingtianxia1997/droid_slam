@@ -43,15 +43,42 @@ git clone --recursive https://github.com/princeton-vl/DROID-SLAM.git
 
 Requires CUDA to be installed on your machine. If you run into issues, make sure the PyTorch and CUDA major versions match with the following check (minor version mismatch should be fine).
 
-```Bash
-nvidia-smi
-python -c "import torch; print(torch.version.cuda)"
-```
 
-```Bash
+### Dependencies
+```bash
+# venv
+sudo apt install python3.10-venv
+
+# nvidia cuda toolkit 12.6(only tested this one, but 12.x should all work)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin
+sudo mv cuda-ubuntu2204.pin /etc/apt/preferences.d/cuda-repository-pin-600
+wget https://developer.download.nvidia.com/compute/cuda/12.6.0/local_installers/cuda-repo-ubuntu2204-12-6-local_12.6.0-560.28.03-1_amd64.deb
+sudo dpkg -i cuda-repo-ubuntu2204-12-6-local_12.6.0-560.28.03-1_amd64.deb
+sudo cp /var/cuda-repo-ubuntu2204-12-6-local/cuda-*-keyring.gpg /usr/share/keyrings/
+sudo apt-get update
+sudo apt-get -y install cuda-toolkit-12-6
+```
+#### add the following to your ~/.bashrc:
+```bash
+# nvidia-cuda-toolkit usage
+#export CUDA_HOME=/usr
+#export PATH=/usr/bin:$PATH
+#export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+
+# cuda toolkit 12.6, comment if default 11.5 needed
+export CUDA_HOME=/usr/local/cuda-12.6
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+```
+#### check if cuda version is correct after source
+```bash
+which nvcc
+nvcc -V
 python3 -m venv .venv
 source .venv/bin/activate
-
+python -c "import torch; print(torch.version.cuda)"
+```
+```Bash
 # install requirements (tested up to torch 2.7)
 pip install -r requirements.txt
 
@@ -59,31 +86,35 @@ pip install -r requirements.txt
 pip install moderngl moderngl-window
 
 # install third-party modules (this will take a while)
-# pip install thirdparty/lietorch
-# 
-https://github.com/princeton-vl/lietorch/tree/master
+
+# for lietorch, clone into a separate folder or switch to master branch instead of the one specified by the submodule
+# then follow the README there or run the following bash commands
+git clone https://github.com/princeton-vl/lietorch/tree/master
+cd */lietorch
+python3 -m venv .venv
+source .venv/bin/activate
+export TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;9.0"
+pip install --no-build-isolation git+https://github.com/princeton-vl/lietorch.git # --no-build-isolation is a must
+pip install opencv-python open3d scipy pyyaml
+
+# pytorch_scatter can be installed as a submodule in DROID_SLAM without any problem
+cd */DROID_SLAM
 pip install thirdparty/pytorch_scatter
 
 # install droid-backends
 pip install -e .
 ```
 
-<!-- ### Deprecated Conda Installation
+## Project related demo
+```bash
+# change the path for rgb and depth accordingly, see vln-humanoid repo
+python3 demo.py --imagedir=$(vln-humanoids-home)/camera_feed/legged/rgb --depthdir=$(vln-humanoids-home)/camera_feed/legged/depth --calib=calib/h1.txt --stride 1 --upsample
 
-1. Creating a new anaconda environment using the provided .yaml file. Use `environment_novis.yaml` to if you do not want to use the visualization
-```Bash
-conda env create -f environment.yaml
-pip install evo --upgrade --no-binary evo
-pip install gdown
+# optional: test droid-slam performance based on the jetbot in vln_humanoid repo
+python3 demo.py --imagedir=$(vln-humanoids-home)/camera_feed/wheeled/rgb --depthdir=$(vln-humanoids-home)/camera_feed/wheeled/depth --calib=calib/wheeled_robot.txt
 ```
 
-2. Compile the extensions (takes about 10 minutes)
-```Bash
-python setup.py install
-``` -->
-
-
-## Demos
+## Demos(from original droid-slam as reference)
 
 1. Download the model from google drive: [droid.pth](https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view?usp=sharing) or with
     ```Bash
