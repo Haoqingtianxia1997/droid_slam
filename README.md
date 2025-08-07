@@ -111,6 +111,8 @@ pip install -e .
 python3 demo.py --imagedir=$(vln-humanoids-home)/camera_feed/legged/rgb --depthdir=$(vln-humanoids-home)/camera_feed/legged/depth --calib=calib/h1.txt --stride 1 --upsample
 
 # subscribe ros2 topic
+source /opt/ros/humble/setup.bash
+
 python3 demo_ros2_realtime.py --rgb_topic=/camera/rgb/image_raw --depth_topic=/camera/depth/image_raw --calib=calib/h1.txt --upsample --asynchronous --publish_pose
 
 # optional: test droid-slam performance based on the jetbot in vln_humanoid repo
