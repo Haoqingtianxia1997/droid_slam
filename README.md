@@ -110,6 +110,9 @@ pip install -e .
 # change the path for rgb and depth accordingly, see vln-humanoid repo
 python3 demo.py --imagedir=$(vln-humanoids-home)/camera_feed/legged/rgb --depthdir=$(vln-humanoids-home)/camera_feed/legged/depth --calib=calib/h1.txt --stride 1 --upsample
 
+# subscribe ros2 topic
+python3 demo_ros2_realtime.py --rgb_topic=/camera/rgb/image_raw --depth_topic=/camera/depth/image_raw --calib=calib/h1.txt --upsample --asynchronous --publish_pose
+
 # optional: test droid-slam performance based on the jetbot in vln_humanoid repo
 python3 demo.py --imagedir=$(vln-humanoids-home)/camera_feed/wheeled/rgb --depthdir=$(vln-humanoids-home)/camera_feed/wheeled/depth --calib=calib/wheeled_robot.txt
 ```

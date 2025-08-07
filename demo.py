@@ -23,7 +23,7 @@ def show_image(image):
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
 
-def image_stream(imagedir, calib, stride, depthdir=None, depth_scale=1.0, min_depth=0.1, max_depth=50.0):
+def image_stream(imagedir, calib, stride, depthdir=None, depth_scale=1.0, min_depth=0.1, max_depth=100000.0):
     """ image generator """
 
     calib = np.loadtxt(calib, delimiter=" ")
@@ -48,7 +48,7 @@ def image_stream(imagedir, calib, stride, depthdir=None, depth_scale=1.0, min_de
             image = cv2.undistort(image, K, calib[4:])
 
         h0, w0, _ = image.shape
-        # 提高分辨率以获得更高密度的点云
+        # highest resolution without break
         h1 = int(h0 * np.sqrt((720 * 540) / (h0 * w0)))
         w1 = int(w0 * np.sqrt((720 * 540) / (h0 * w0)))
 
@@ -65,13 +65,13 @@ def image_stream(imagedir, calib, stride, depthdir=None, depth_scale=1.0, min_de
         if depth_list is not None and t < len(depth_list):
             depth_img = cv2.imread(os.path.join(depthdir, depth_list[t]), cv2.IMREAD_ANYDEPTH)
             if depth_img is not None:
-                # 使用可配置的深度缩放因子
+                
                 depth = torch.as_tensor(depth_img.astype(np.float32) / depth_scale)
                 
-                # 应用深度范围限制
+                # clip depth
                 depth = torch.clamp(depth, min_depth, max_depth)
                 
-                # 过滤无效深度值
+                # filter invalid depth values
                 depth = torch.where(depth > 0, depth, torch.tensor(0.0))
                 
                 print(f"Frame {t}: Depth range [{depth[depth>0].min():.3f}, {depth[depth>0].max():.3f}] meters")
@@ -111,7 +111,7 @@ if __name__ == '__main__':
     parser.add_argument("--depthdir", type=str, help="path to depth directory (optional)")
     parser.add_argument("--depth_scale", type=float, default=1.0, help="depth scale factor (TUM: 5000.0, NYU: 1000.0, Isaac Sim: 1.0)")
     parser.add_argument("--min_depth", type=float, default=0.1, help="minimum valid depth in meters")
-    parser.add_argument("--max_depth", type=float, default=50.0, help="maximum valid depth in meters")
+    parser.add_argument("--max_depth", type=float, default=100000.0, help="maximum valid depth in meters")
     parser.add_argument("--t0", default=0, type=int, help="starting frame")
     parser.add_argument("--stride", default=1, type=int, help="frame stride")
 
