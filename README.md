@@ -114,6 +114,41 @@ python3 demo.py --imagedir=$(vln-humanoids-home)/camera_feed/legged/rgb --depthd
 python3 demo.py --imagedir=$(vln-humanoids-home)/camera_feed/wheeled/rgb --depthdir=$(vln-humanoids-home)/camera_feed/wheeled/depth --calib=calib/wheeled_robot.txt
 ```
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ## Demos(from original droid-slam as reference)
 
 1. Download the model from google drive: [droid.pth](https://drive.google.com/file/d/1PpqVt1H4maBa_GbPJp4NwxRsd9jk-elh/view?usp=sharing) or with
