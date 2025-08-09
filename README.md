@@ -1,26 +1,5 @@
 # DROID-SLAM
 
-
-<!-- <center><img src="misc/DROID.png" width="640" style="center"></center> -->
-
-
-[![IMAGE ALT TEXT HERE](misc/screenshot.png)](https://www.youtube.com/watch?v=GG78CSlSHSA)
-
-
-
-[DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras](https://arxiv.org/abs/2108.10869)  
-Zachary Teed and Jia Deng
-
-```
-@article{teed2021droid,
-  title={{DROID-SLAM: Deep Visual SLAM for Monocular, Stereo, and RGB-D Cameras}},
-  author={Teed, Zachary and Deng, Jia},
-  journal={Advances in neural information processing systems},
-  year={2021}
-}
-```
-
-
 ## Requirements
 
 To run the code you will need ...
@@ -28,39 +7,23 @@ To run the code you will need ...
 
 * **Training:** Training requires a GPU with at least 24G of memory. We train on 4 x RTX-3090 GPUs.
 
-## Getting Started
-Clone the repo using the `--recursive` flag
-```Bash
-git clone --recursive https://github.com/princeton-vl/DROID-SLAM.git
-```
-
-  If you forgot `--recursive`
-  ```Bash
-  git submodule update --init --recursive .
-  ```
-
 ### Installing
 
 Requires CUDA to be installed on your machine. If you run into issues, make sure the PyTorch and CUDA major versions match with the following check (minor version mismatch should be fine).
 
-
 ### Dependencies
-```bash
-# venv
-sudo apt install python3.10-venv
 
-# nvidia cuda toolkit 12.6(only tested this one, but 12.x should all work)
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin
-sudo mv cuda-ubuntu2204.pin /etc/apt/preferences.d/cuda-repository-pin-600
-wget https://developer.download.nvidia.com/compute/cuda/12.6.0/local_installers/cuda-repo-ubuntu2204-12-6-local_12.6.0-560.28.03-1_amd64.deb
-sudo dpkg -i cuda-repo-ubuntu2204-12-6-local_12.6.0-560.28.03-1_amd64.deb
-sudo cp /var/cuda-repo-ubuntu2204-12-6-local/cuda-*-keyring.gpg /usr/share/keyrings/
-sudo apt-get update
-sudo apt-get -y install cuda-toolkit-12-6
+1. nvidia cuda toolkit 12.6(only tested this one, but 12.x should all work)
+Link: https://developer.nvidia.com/cuda-12-6-0-download-archive?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_local
+
+2. python 3.10 virtual environment
+```bash
+sudo apt install python3.10-venv
 ```
+
 #### add the following to your ~/.bashrc:
 ```bash
-# nvidia-cuda-toolkit usage
+# nvidia-cuda-toolkit from apt repository
 #export CUDA_HOME=/usr
 #export PATH=/usr/bin:$PATH
 #export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
@@ -70,39 +33,44 @@ export CUDA_HOME=/usr/local/cuda-12.6
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ```
+
 #### check if cuda version is correct after source
 ```bash
 which nvcc
 nvcc -V
 python3 -m venv .venv
 source .venv/bin/activate
-python -c "import torch; print(torch.version.cuda)"
 ```
 ```Bash
 # install requirements (tested up to torch 2.7)
 pip install -r requirements.txt
+python -c "import torch; print(torch.version.cuda)"
 
 # optional (for visualization)
 pip install moderngl moderngl-window
 
 # install third-party modules (this will take a while)
-
-# for lietorch, clone into a separate folder or switch to master branch instead of the one specified by the submodule
-# then follow the README there or run the following bash commands
+# submodule lietorch
 git clone https://github.com/princeton-vl/lietorch/tree/master
-cd */lietorch
-python3 -m venv .venv
-source .venv/bin/activate
+cd thirdparty/lietorch
 export TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;9.0"
-pip install --no-build-isolation git+https://github.com/princeton-vl/lietorch.git # --no-build-isolation is a must
+pip install --no-build-isolation git+https://github.com/princeton-vl/lietorch.git
 pip install opencv-python open3d scipy pyyaml
-
-# pytorch_scatter can be installed as a submodule in DROID_SLAM without any problem
-cd */DROID_SLAM
+# submodule pytorch_scatter
 pip install thirdparty/pytorch_scatter
 
 # install droid-backends
 pip install -e .
+# optional: if droid-backends installation fails:
+sudo apt update
+sudo apt install -y libeigen3-dev ninja-build 
+# then expose Eigen's include path to the compiler and install droid-backends again
+export CPATH=/usr/include/eigen3:$CPATH
+export CPLUS_INCLUDE_PATH=/usr/include/eigen3:$CPLUS_INCLUDE_PATH
+pip install -e .
+
+# download model
+./tools/download_model.sh
 ```
 
 ## Project related demo
