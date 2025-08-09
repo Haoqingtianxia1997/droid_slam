@@ -9,5 +9,6 @@ scipy
 open3d
 gdown
 tensorboard
-opencv-python
+numpy<2.0
+opencv-python<4.10.0
 pyyaml
