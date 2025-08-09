@@ -50,24 +50,26 @@ python -c "import torch; print(torch.version.cuda)"
 pip install moderngl moderngl-window
 
 # install third-party modules (this will take a while)
+# in droid-slam main folder
+git submodule update --init --recursive .
 # submodule lietorch
-git clone https://github.com/princeton-vl/lietorch/tree/master
 cd thirdparty/lietorch
 export TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9;9.0"
 pip install --no-build-isolation git+https://github.com/princeton-vl/lietorch.git
 pip install opencv-python open3d scipy pyyaml
 # submodule pytorch_scatter
+cd ../..
 pip install thirdparty/pytorch_scatter
 
 # install droid-backends
 pip install -e .
 # optional: if droid-backends installation fails:
-sudo apt update
-sudo apt install -y libeigen3-dev ninja-build 
-# then expose Eigen's include path to the compiler and install droid-backends again
-export CPATH=/usr/include/eigen3:$CPATH
-export CPLUS_INCLUDE_PATH=/usr/include/eigen3:$CPLUS_INCLUDE_PATH
-pip install -e .
+    sudo apt update
+    sudo apt install -y libeigen3-dev ninja-build 
+    # then expose Eigen's include path to the compiler and install droid-backends again
+    export CPATH=/usr/include/eigen3:$CPATH
+    export CPLUS_INCLUDE_PATH=/usr/include/eigen3:$CPLUS_INCLUDE_PATH
+    pip install -e .
 
 # download model
 ./tools/download_model.sh
