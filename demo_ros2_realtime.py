@@ -23,15 +23,81 @@ import torch.nn.functional as F
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, Quaternion, PoseWithCovarianceStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 import message_filters
+
+# UDP接收相关模块
+import socket
+import json
+
+# 导入UDP接收函数
+from droid_slam.visualizer.droid_visualizer import create_udp_receiver, receive_trajectory_data_udp
+
+# 添加数学计算相关模块
+import math
+
+
 
 def show_image(image):
     image = image.permute(1, 2, 0).cpu().numpy()
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
+
+def quaternion_to_rotation_matrix(q):
+    """将四元数转换为旋转矩阵"""
+    w, x, y, z = q.w, q.x, q.y, q.z
+    
+    # 归一化四元数
+    norm = math.sqrt(w*w + x*x + y*y + z*z)
+    if norm == 0:
+        return np.eye(3)
+    
+    w, x, y, z = w/norm, x/norm, y/norm, z/norm
+    
+    # 构造旋转矩阵
+    R = np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+        [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+        [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+    ])
+    
+    return R
+
+def calculate_angle_with_xy_plane(quaternion):
+    """
+    计算四元数对应的向量与世界坐标系xy平面的夹角（锐角，0-90度）
+    
+    Args:
+        quaternion: Quaternion消息，包含w, x, y, z
+    
+    Returns:
+        angle_degrees: 与xy平面的锐角夹角（度）
+    """
+    # 获取旋转矩阵
+    R = quaternion_to_rotation_matrix(quaternion)
+    
+    # 假设我们要计算的是z轴方向向量与xy平面的夹角
+    # 旋转后的z轴方向向量是旋转矩阵的第三列
+    z_vector = R[:, 2]  # [x, y, z]分量
+    
+    # xy平面的法向量是 [0, 0, 1]
+    # 计算z_vector与xy平面的夹角
+    # 向量与平面的夹角 = 90° - 向量与平面法向量的夹角
+    
+    # z_vector与xy平面法向量[0,0,1]的夹角
+    cos_angle_with_normal = abs(z_vector[2])  # |z分量| / |向量长度|，由于向量已归一化
+    
+    # 与xy平面的夹角
+    angle_with_plane_rad = math.asin(cos_angle_with_normal)  # arcsin(|z分量|)
+    angle_with_plane_deg = math.degrees(angle_with_plane_rad)
+    
+    # 确保返回锐角（0-90度）
+    if angle_with_plane_deg > 90:
+        angle_with_plane_deg = 180 - angle_with_plane_deg
+    
+    return 90 - angle_with_plane_deg
 
 class DroidSlamNode(Node):
     def __init__(self, rgb_topic, depth_topic, calib_file, args):
@@ -42,11 +108,27 @@ class DroidSlamNode(Node):
         self.droid = None
         self.frame_count = 0
         
+        # UDP接收器相关
+        self.udp_socket = None
+        self.latest_trajectory_data = None
+        self.trajectory_lock = threading.Lock()
+        
+        # UDP发送器相关（用于发送角度数据）
+        self.angle_udp_socket = None
+        self.angle_udp_host = "127.0.0.1"
+        self.angle_udp_port = 12347  # 使用不同的端口发送角度数据
+        
+        # 初始化UDP接收器
+        if args.publish_pose:
+            self._init_udp_receiver()
+            self._init_angle_udp_sender()
+        
+        
         # Create pose publishers (only if enabled)
         if args.publish_pose:
-            self.pose_pub = self.create_publisher(PoseStamped, 'droid_slam/pose', 10)
-            self.odom_pub = self.create_publisher(Odometry, 'droid_slam/odometry', 10)
-            
+            self.pose_pub = self.create_publisher(PoseStamped, 'droid_slam/pose', 1)
+            self.odom_pub = self.create_publisher(Odometry, 'droid_slam/odometry', 1)
+            self.first_quat_sub = self.create_subscription(Quaternion, '/robot/root_quaternion', self.first_quat_callback, 1)
             # TF broadcaster for publishing transform
             try:
                 from tf2_ros import TransformBroadcaster
@@ -59,7 +141,10 @@ class DroidSlamNode(Node):
             self.pose_pub = None
             self.odom_pub = None
             self.publish_tf = False
+            self.first_quat_sub = None
 
+        self.quaternion_offset = Quaternion()
+        self.current_angle_with_xy_plane = 0.0  # 存储当前与xy平面的夹角
         
         # Store previous pose for velocity calculation
         self.previous_pose = None
@@ -80,262 +165,171 @@ class DroidSlamNode(Node):
         self.ts = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub], 
             queue_size=10, 
-            slop=0.01  # 允许10ms的时间差
+            slop=0.01  
         )
         self.ts.registerCallback(self.synchronized_callback)
     
-    #TODO: video frame wrong
-    def publish_camera_pose(self, frame_id, timestamp, processed_frame_id=None):
-        """发布相机位姿到ROS2话题"""
-        if self.droid is None or not self.args.publish_pose:
-            return
-            
-        # 获取当前帧数
-        if hasattr(self.droid, "video2"):
-            video = self.droid.video2
-        else:
-            video = self.droid.video
-            
-        current_frame = video.counter.value - 1  # 当前帧索引
+    def first_quat_callback(self, msg: Quaternion):
+        """处理四元数消息并计算与xy平面的夹角"""
+        self.quaternion_offset.w = msg.w
+        self.quaternion_offset.x = msg.x
+        self.quaternion_offset.y = msg.y
+        self.quaternion_offset.z = msg.z
         
-        # 如果有处理帧ID，使用它作为参考
-        if processed_frame_id is not None and processed_frame_id > 0:
-            # 使用处理帧ID-1作为当前帧（因为我们刚刚处理了这一帧）
-            frame_to_use = min(processed_frame_id - 1, current_frame)
-            
-            # 如果video counter还没有更新，可能需要等待一下
-            if current_frame < 0 and processed_frame_id > 0:
-                # 直接使用 processed_frame_id - 1，但要确保不小于0
-                frame_to_use = max(0, processed_frame_id - 1)
-                self.get_logger().warning(f"Video counter not updated yet, using processed_frame_id-1: {frame_to_use}")
-        else:
-            frame_to_use = current_frame
-            
-        print(f"Using frame_to_use: {frame_to_use}")
+        # 计算与xy平面的锐角夹角
+        self.current_angle_with_xy_plane = calculate_angle_with_xy_plane(msg)
         
-        if frame_to_use < 0:
-            self.get_logger().warning(f"Frame index is negative: {frame_to_use}, skipping pose publication")
-            return
-            
-        # 获取位姿数据 [tx, ty, tz, qx, qy, qz, qw]
+        # 通过UDP发送角度数据
+        if self.args.publish_pose and self.angle_udp_socket is not None:
+            angle_data = {
+                'angle_with_xy_plane': self.current_angle_with_xy_plane,
+                'timestamp': time.time()
+            }
+            self._send_angle_data_udp(angle_data)
+        
+
+    def _init_udp_receiver(self):
+        """初始化UDP接收器"""
         try:
-            pose_data = video.poses[frame_to_use].cpu().numpy()
-            print("==================================================", pose_data)
-        except IndexError as e:
-            self.get_logger().warning(f"Cannot access pose data for frame {frame_to_use}: {e}")
+            self.udp_socket = create_udp_receiver(host="127.0.0.1", port=12346, timeout=0.001)
+            if self.udp_socket:
+                # 启动UDP接收线程
+                self.udp_thread = threading.Thread(target=self._udp_receiver_thread, daemon=True)
+                self.udp_thread.start()
+                self.get_logger().info("UDP receiver thread started")
+        except Exception as e:
+            self.get_logger().error(f"Failed to initialize UDP receiver: {e}")
+            self.udp_socket = None
+    
+    def _init_angle_udp_sender(self):
+        """初始化UDP发送器用于发送角度数据"""
+        try:
+            self.angle_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.get_logger().info("Angle UDP sender initialized")
+        except Exception as e:
+            self.get_logger().error(f"Failed to initialize angle UDP sender: {e}")
+            self.angle_udp_socket = None
+    
+    def _send_angle_data_udp(self, angle_data):
+        """通过UDP发送角度数据"""
+        if self.angle_udp_socket is None:
             return
-        # 创建ROS时间戳
-        ros_time = self.get_clock().now().to_msg()
-        current_time = time.time()
-        
-        # 计算速度 (如果有前一帧数据)
-        linear_vel = [0.0, 0.0, 0.0]
-        angular_vel = [0.0, 0.0, 0.0]
-        
-        if self.previous_pose is not None and self.previous_time is not None:
-            dt = current_time - self.previous_time
-            if dt > 0:
-                # 计算线性速度
-                linear_vel[0] = (pose_data[0] - self.previous_pose[0]) / dt
-                linear_vel[1] = (pose_data[1] - self.previous_pose[1]) / dt
-                linear_vel[2] = (pose_data[2] - self.previous_pose[2]) / dt
-                
-                # 简单的角速度估计（基于四元数差异）
-                # 这里可以做更精确的计算，但作为示例这样就足够了
-        
-        # 更新前一帧数据
-        self.previous_pose = pose_data.copy()
-        self.previous_time = current_time
-        
-        # 发布PoseStamped消息
-        if self.pose_pub is not None:
-            pose_msg = PoseStamped()
-            pose_msg.header.stamp = ros_time
-            pose_msg.header.frame_id = self.args.map_frame_id
-            pose_msg.pose.position.x = float(pose_data[0])
-            pose_msg.pose.position.y = float(pose_data[1])
-            pose_msg.pose.position.z = float(pose_data[2])
-            pose_msg.pose.orientation.x = float(pose_data[3])
-            pose_msg.pose.orientation.y = float(pose_data[4])
-            pose_msg.pose.orientation.z = float(pose_data[5])
-            pose_msg.pose.orientation.w = float(pose_data[6])
-            self.pose_pub.publish(pose_msg)
-        
-        # 发布Odometry消息
-        if self.odom_pub is not None:
-            odom_msg = Odometry()
-            odom_msg.header.stamp = ros_time
-            odom_msg.header.frame_id = self.args.map_frame_id
-            odom_msg.child_frame_id = frame_id
-            odom_msg.pose.pose.position.x = float(pose_data[0])
-            odom_msg.pose.pose.position.y = float(pose_data[1])
-            odom_msg.pose.pose.position.z = float(pose_data[2])
-            odom_msg.pose.pose.orientation.x = float(pose_data[3])
-            odom_msg.pose.pose.orientation.y = float(pose_data[4])
-            odom_msg.pose.pose.orientation.z = float(pose_data[5])
-            odom_msg.pose.pose.orientation.w = float(pose_data[6])
             
-            # 添加速度信息
-            odom_msg.twist.twist.linear.x = linear_vel[0]
-            odom_msg.twist.twist.linear.y = linear_vel[1]
-            odom_msg.twist.twist.linear.z = linear_vel[2]
-            odom_msg.twist.twist.angular.x = angular_vel[0]
-            odom_msg.twist.twist.angular.y = angular_vel[1]
-            odom_msg.twist.twist.angular.z = angular_vel[2]
-            self.odom_pub.publish(odom_msg)
-        
-        # 发布TF变换
-        if self.publish_tf:
+        try:
+            # 将角度数据序列化为JSON
+            json_data = json.dumps(angle_data)
+            data_bytes = json_data.encode('utf-8')
+            
+            # 发送数据
+            self.angle_udp_socket.sendto(data_bytes, (self.angle_udp_host, self.angle_udp_port))
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to send angle data via UDP: {e}")
+    
+    def _udp_receiver_thread(self):
+        """UDP接收线程"""
+        while rclpy.ok():
             try:
-                t = TransformStamped()
-                t.header.stamp = ros_time
-                t.header.frame_id = self.args.map_frame_id
-                t.child_frame_id = frame_id
-                t.transform.translation.x = float(pose_data[0])
-                t.transform.translation.y = float(pose_data[1])
-                t.transform.translation.z = float(pose_data[2])
-                t.transform.rotation.x = float(pose_data[3])
-                t.transform.rotation.y = float(pose_data[4])
-                t.transform.rotation.z = float(pose_data[5])
-                t.transform.rotation.w = float(pose_data[6])
-                self.tf_broadcaster.sendTransform(t)
+                if self.udp_socket:
+                    trajectory_data = receive_trajectory_data_udp(self.udp_socket)
+                    if trajectory_data:
+                        with self.trajectory_lock:
+                            self.latest_trajectory_data = trajectory_data
+                        # self.get_logger().debug("Received trajectory data via UDP")
             except Exception as e:
-                self.get_logger().warning(f"Failed to publish TF: {str(e)}")
-        
-        # # 记录位姿信息（降低频率以避免日志过多）
-        # if frame_to_use % 1 == 0:  # 每1帧打印一次
-        #     self.get_logger().info(f'Published pose for frame {frame_to_use}: '
-        #                           f'pos=({pose_data[0]:.3f}, {pose_data[1]:.3f}, {pose_data[2]:.3f}), '
-        #                           f'quat=({pose_data[3]:.3f}, {pose_data[4]:.3f}, {pose_data[5]:.3f}, {pose_data[6]:.3f}), '
-        #                           f'vel=({linear_vel[0]:.3f}, {linear_vel[1]:.3f}, {linear_vel[2]:.3f})')
+                # self.get_logger().error(f"Error in UDP receiver thread: {e}")
+                pass
+            time.sleep(0.001)  # 小延迟避免CPU占用过高
+  
+    def publish_camera_pose(self, stamp):
+  
+        if not self.args.publish_pose:
+            return
+            
 
-    def get_trajectory_data(self):
-        """获取完整的轨迹数据"""
-        if self.droid is None:
-            return None
-            
-        # 获取视频数据
-        if hasattr(self.droid, "video2"):
-            video = self.droid.video2
-        else:
-            video = self.droid.video
-            
-        t = video.counter.value
-        if t <= 0:
-            return None
-            
-        trajectory_data = {
-            "timestamps": video.tstamp[:t].cpu().numpy(),
-            "poses": video.poses[:t].cpu().numpy(),  # [N, 7] - [tx, ty, tz, qx, qy, qz, qw]
-            "frame_count": t
-        }
+        trajectory_data = None
+        with self.trajectory_lock:
+            trajectory_data = self.latest_trajectory_data
         
-        return trajectory_data
+        if trajectory_data is not None and 'latest_position' in trajectory_data:
+        
+            latest_pos = trajectory_data['latest_position']
+            
 
-    def save_trajectory_to_file(self, filename):
-        """保存轨迹到文件"""
-        trajectory_data = self.get_trajectory_data()
-        if trajectory_data is None:
-            self.get_logger().warning("No trajectory data to save")
-            return False
-            
-        try:
-            np.savez(filename, 
-                    timestamps=trajectory_data["timestamps"],
-                    poses=trajectory_data["poses"],
-                    frame_count=trajectory_data["frame_count"])
-            self.get_logger().info(f"Trajectory saved to {filename}")
-            return True
-        except Exception as e:
-            self.get_logger().error(f"Failed to save trajectory: {str(e)}")
-            return False
 
-    def visualize_synchronized_images(self, rgb_image, depth_image, rgb_stamp, depth_stamp):
-        """可视化同步的RGB和深度图像"""
-        # 计算时间戳差异
-        rgb_time = rgb_stamp.sec + rgb_stamp.nanosec * 1e-9
-        depth_time = depth_stamp.sec + depth_stamp.nanosec * 1e-9
-        time_diff = abs(rgb_time - depth_time) * 1000  # 转换为毫秒
-        
-        # 创建显示窗口
-        display_rgb = cv2.resize(rgb_image, (640, 480))
-        
-        # 处理深度图像用于显示
-        if depth_image is not None:
-            # 归一化深度图像到0-255范围用于显示
-            if depth_image.max() > depth_image.min():
-                depth_normalized = cv2.normalize(depth_image, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
-                
-                # 显示深度值范围
-                valid_depth = depth_image[depth_image > 0]
-                if len(valid_depth) > 0:
-                    depth_range_text = f"Depth: {valid_depth.min():.1f}-{valid_depth.max():.1f}"
-                else:
-                    depth_range_text = "No valid depth"
-            else:
-                depth_colored = np.zeros((*depth_image.shape, 3), dtype=np.uint8)
-                depth_range_text = "Invalid depth range"
-                
-            display_depth = cv2.resize(depth_colored, (640, 480))
             
-            # 在图像上添加时间戳信息
-            cv2.putText(display_rgb, f'RGB: {rgb_time:.3f}s', (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display_depth, f'Depth: {depth_time:.3f}s', (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(display_depth, f'Time diff: {time_diff:.1f}ms', (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(display_depth, depth_range_text, (10, 90), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(display_depth, f'Scale: {self.args.depth_scale}', (10, 120), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # 水平拼接显示
-            combined = np.hstack([display_rgb, display_depth])
-            cv2.imshow('Synchronized RGB-Depth (ApproximateTimeSynchronizer)', combined)
-        else:
-            cv2.putText(display_rgb, f'RGB: {rgb_time:.3f}s (No Depth)', (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.imshow('Synchronized RGB-Depth (ApproximateTimeSynchronizer)', display_rgb)
-        
-        cv2.waitKey(1)
+            # 应用反向旋转补偿
 
+            latest_pos = np.array([latest_pos['x'], latest_pos['y'], latest_pos['z']])
+
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = stamp
+
+            pose_msg.pose.position.x = float(latest_pos[0])  
+            pose_msg.pose.position.y = float(latest_pos[2])  
+            pose_msg.pose.position.z = float(latest_pos[1])  
+
+            pose_msg.pose.orientation.x = 0.0
+            pose_msg.pose.orientation.y = 0.0
+            pose_msg.pose.orientation.z = 0.0
+            pose_msg.pose.orientation.w = 1.0
+            
+            self.pose_pub.publish(pose_msg)
+            
+            odom_msg = Odometry()
+            odom_msg.header.stamp = stamp
+        
+            odom_msg.pose.pose = pose_msg.pose
+            
+
+            current_time = stamp.sec + stamp.nanosec * 1e-9
+            if self.previous_pose is not None and self.previous_time is not None:
+                dt = current_time - self.previous_time
+                if dt > 0:
+                    dx = latest_pos[0] - self.previous_pose[0]
+                    dy = latest_pos[2] - self.previous_pose[2]
+                    dz = latest_pos[1] - self.previous_pose[1]
+
+                    odom_msg.twist.twist.linear.x = dx / dt
+                    odom_msg.twist.twist.linear.y = dy / dt
+                    odom_msg.twist.twist.linear.z = dz / dt
+        
+            if self.odom_pub is not None:
+                self.odom_pub.publish(odom_msg)
+            
+
+            self.previous_pose = latest_pos.copy()
+            self.previous_time = current_time      
+    
+   
     def synchronized_callback(self, rgb_msg, depth_msg):
-        try:
-            # Convert ROS message to OpenCV format
-            rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-            depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
+        # Convert ROS message to OpenCV format
+        rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
+
+        # Process image data
+        processed_data = self.process_frame(rgb_image, depth_image)
+        
+        if processed_data is not None:
+            t, image_tensor, depth_tensor, intrinsics = processed_data
             
-            # 可视化RGB和深度图像以验证同步效果
-            # self.visualize_synchronized_images(rgb_image, depth_image, rgb_msg.header.stamp, depth_msg.header.stamp)
-            
-            # Process image data
-            processed_data = self.process_frame(rgb_image, depth_image)
-            
-            if processed_data is not None:
-                t, image_tensor, depth_tensor, intrinsics = processed_data
-                
-                # Show image if visualization is enabled
-                if not self.args.disable_vis:
-                    show_image(image_tensor[0])
+            # Show image if visualization is enabled
+            if not self.args.disable_vis:
+                show_image(image_tensor[0])
 
-                # Initialize DROID (on first frame)
-                if self.droid is None:
-                    self.args.image_size = [image_tensor.shape[2], image_tensor.shape[3]]
-                    self.droid = DroidAsync(self.args) if self.args.asynchronous else Droid(self.args)
+            # Initialize DROID (on first frame)
+            if self.droid is None:
+                self.args.image_size = [image_tensor.shape[2], image_tensor.shape[3]]
+                self.droid = DroidAsync(self.args) if self.args.asynchronous else Droid(self.args)
 
-                # Track current frame
-                self.droid.track(t, image_tensor, depth=depth_tensor, intrinsics=intrinsics)
+            # Track current frame
+            self.droid.track(t, image_tensor, depth=depth_tensor, intrinsics=intrinsics)
 
-                # Publish camera pose after tracking (with a small delay to ensure processing is complete)
-                self.publish_camera_pose(self.args.camera_frame_id, rgb_msg.header.stamp, processed_frame_id=t)
+            # Publish camera pose after tracking (with a small delay to ensure processing is complete)
+            self.publish_camera_pose(rgb_msg.header.stamp)
 
-            else:
-                self.get_logger().warning('process_frame returned None')
-
-        except Exception as e:
-            self.get_logger().error(f'Error processing frame: {str(e)}')
+        else:
+            self.get_logger().warning('process_frame returned None')
 
     def process_frame(self, rgb_image, depth_image):
         """Process RGB and depth images, returning the format needed by DROID-SLAM"""
@@ -380,6 +374,22 @@ class DroidSlamNode(Node):
 
     def terminate_slam(self):
         """Terminate SLAM and save results"""
+        # 关闭UDP socket
+        if self.udp_socket:
+            try:
+                self.udp_socket.close()
+                self.get_logger().info('UDP socket closed')
+            except Exception as e:
+                self.get_logger().error(f'Error closing UDP socket: {str(e)}')
+        
+        # 关闭角度UDP socket
+        if self.angle_udp_socket:
+            try:
+                self.angle_udp_socket.close()
+                self.get_logger().info('Angle UDP socket closed')
+            except Exception as e:
+                self.get_logger().error(f'Error closing angle UDP socket: {str(e)}')
+        
         if self.droid is not None:
             self.get_logger().info('Terminating DROID-SLAM...')
             # Note: Since this is a real-time stream, we cannot pass image_stream to terminate
@@ -453,8 +463,7 @@ def main():
     parser.add_argument("--publish_pose", action="store_true", help="enable pose publishing to ROS topics")
     parser.add_argument("--camera_frame_id", type=str, default="camera_link", help="frame ID for camera in TF tree")
     parser.add_argument("--map_frame_id", type=str, default="map", help="frame ID for map/world coordinate system")
-    parser.add_argument("--trajectory_output", type=str, help="path to save trajectory data (numpy format)")
-    
+
     args = parser.parse_args()
 
     # Set DROID arguments
@@ -486,11 +495,7 @@ def main():
     finally:
         # Terminate SLAM and save results
         traj_est = slam_node.terminate_slam()
-        
-        # Save trajectory data if requested
-        if args.trajectory_output is not None:
-            slam_node.save_trajectory_to_file(args.trajectory_output)
-        
+
         if args.reconstruction_path is not None and slam_node.droid is not None:
             save_reconstruction(slam_node.droid, args.reconstruction_path)
             print(f"Reconstruction results saved to: {args.reconstruction_path}")
