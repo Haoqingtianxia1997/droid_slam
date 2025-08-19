@@ -48,6 +48,34 @@ for i, j in CAM_LINES:
 CAM_SEGMENTS = np.stack(CAM_SEGMENTS, axis=0)
 
 
+def quaternion_to_rotation_matrix(w, x, y, z):
+    """将四元数(w,x,y,z)转换为旋转矩阵"""
+    # 归一化四元数
+    norm = np.sqrt(w*w + x*x + y*y + z*z)
+    w, x, y, z = w/norm, x/norm, y/norm, z/norm
+    
+    # 构建旋转矩阵
+    R = np.array([
+        [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
+        [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)],
+        [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]
+    ])
+    return R
+
+
+def quaternion_multiply(q1, q2):
+    """四元数乘法 q1 * q2，四元数格式为[w,x,y,z]"""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    
+    return np.array([w, x, y, z])
+
+
 def merge_depths_and_poses(depth_video1, depth_video2):
     t1 = depth_video1.counter.value
     t2 = depth_video2.counter.value
@@ -246,15 +274,15 @@ class DroidVisualizer(OrbitDragCameraWindow):
             DroidVisualizer._angle_udp_socket = None
     
     def _angle_receiver_thread(self):
-        """角度数据接收线程"""
+        """四元数数据接收线程"""
         while True:
             try:
                 if DroidVisualizer._angle_udp_socket:
                     data, addr = DroidVisualizer._angle_udp_socket.recvfrom(1024)
                     json_data = data.decode('utf-8')
-                    angle_data = json.loads(json_data)
-                    DroidVisualizer._latest_angle_data = angle_data
-                    # print(f"Received angle data: {angle_data['angle_with_xy_plane']:.2f}°")
+                    quaternion_data = json.loads(json_data)
+                    DroidVisualizer._latest_angle_data = quaternion_data
+                    # print(f"Received quaternion data: {quaternion_data}")
             except socket.timeout:
                 pass
             except Exception as e:
@@ -317,36 +345,37 @@ class DroidVisualizer(OrbitDragCameraWindow):
                     cam_pts_reshaped = cam_pts[:frame_count * points_per_frame].reshape(frame_count, points_per_frame, 3)
                     
                     # 计算每帧相机的中心点作为轨迹点
-                    # 使用所有20个点的平均位置作为相机中心
                     camera_positions = []
                     for frame_idx in range(frame_count):
                         # 计算当前帧所有20个点的平均位置作为相机中心
-                        camera_center = np.mean(cam_pts_reshaped[frame_idx, :, :], axis=0)  # 取所有20个点的平均位置
+                        camera_center_slam = np.mean(cam_pts_reshaped[frame_idx, :, :], axis=0)  # SLAM坐标系中的相机位置
                         
-                        # 获取从UDP接收的角度数据
-                        received_angle = 0.0
+        
                         if DroidVisualizer._latest_angle_data is not None:
-                            received_angle = DroidVisualizer._latest_angle_data.get('angle_with_xy_plane', 0.0)
+                            torso_quat_data = DroidVisualizer._latest_angle_data.get('torso_to_world_quat', {})
+                            torso_to_world_quat = np.array([
+                                torso_quat_data.get('w', 1.0),
+                                torso_quat_data.get('x', 0.0),
+                                torso_quat_data.get('y', 0.0),
+                                torso_quat_data.get('z', 0.0)
+                            ])
                         
-                        # 补偿：反向映射回水平面（相机从向下倾斜10度映射回水平）
-                        # 创建绕X轴旋转的旋转矩阵（向上旋转，补偿向下倾斜）
-                        angle_deg = -20 # 原有的-10度补偿加上接收到的角度
-                        print(f"Received angle: {received_angle:.2f}°, Adjusted angle for compensation: {angle_deg:.2f}°")
-                        angle_rad = np.radians(angle_deg)
-                        cos_a = np.cos(angle_rad)
-                        sin_a = np.sin(angle_rad)
+                        # 相机到torso的变换（根据您提供的四元数）
+                        camera_to_torso_quat = np.array([0.45451948, -0.54167522, 0.54167522, -0.45451948])
                         
-                        # 绕X轴旋转矩阵（向上旋转）
-                        rotation_matrix = np.array([
-                            [1.0, 0.0, 0.0],
-                            [0.0, cos_a, -sin_a],
-                            [0.0, sin_a, cos_a]
-                        ])
+                        # 计算相机到世界坐标系的四元数：camera_to_world = torso_to_world * camera_to_torso
+                        camera_to_world_quat = quaternion_multiply(torso_to_world_quat, camera_to_torso_quat)
+                        # 将四元数转换为旋转矩阵
+                        R_camera_to_world = quaternion_to_rotation_matrix(
+                            camera_to_world_quat[0], camera_to_world_quat[1], 
+                            camera_to_world_quat[2], camera_to_world_quat[3]
+                        )
                         
-                        # 应用反向旋转补偿
-                        camera_center_compensated = rotation_matrix @ camera_center
+                        # 关键修改：camera_center_slam是SLAM相机坐标系中的位置，需要正确变换
+                        # 将SLAM相机坐标系中的相机位置变换到世界坐标系
+                        camera_position_world = R_camera_to_world @ camera_center_slam
                         
-                        camera_positions.append(camera_center_compensated)
+                        camera_positions.append(camera_position_world)
                     
                     camera_positions = np.array(camera_positions)
                     
@@ -356,21 +385,20 @@ class DroidVisualizer(OrbitDragCameraWindow):
                     # 存储最新的轨迹数据到类变量（供外部访问）
                     if len(self.trajectory_points) > 0:
                         # 提取x和z坐标（3D plot中的x对应真实x，z对应真实y）
-                        x_coords = [p[0] for p in self.trajectory_points]  # 真实x
-                        z_coords = [p[2] for p in self.trajectory_points]  # 真实y (3D plot中的z)
-                        y_coords = [p[1] for p in self.trajectory_points]  # 真实z (3D plot中的y，基本不变)
-                        
+                        x_coords = [p[0] for p in self.trajectory_points]
+                        y_coords = [p[1] for p in self.trajectory_points]
+                        z_coords = [p[2] for p in self.trajectory_points]
                         trajectory_data = {
                             'x_coords': x_coords,
-                            'y_coords': y_coords,  # 真实z
-                            'z_coords': z_coords,  # 真实y
+                            'y_coords': y_coords,
+                            'z_coords': z_coords,
                             'frame_count': frame_count,
                             'latest_position': {
                                 'x': x_coords[-1],     
                                 'y': y_coords[-1],      
                                 'z': z_coords[-1]      
                             },
-                            'timestamp': time.time()  # 添加时间戳
+                            'timestamp': time.time()
                         }
                         
                         DroidVisualizer._latest_trajectory_data = trajectory_data
@@ -389,15 +417,30 @@ class DroidVisualizer(OrbitDragCameraWindow):
                         # 更新当前位置点
                         self.current_point.set_data_3d([x_data[-1]], [y_data[-1]], [z_data[-1]])
                         
-                        # 动态调整坐标轴范围
+                        # 动态调整坐标轴范围，保持各轴分度值相同
                         margin = 0.5  # 边距
+                        
+                        # 计算每个轴的数据范围
                         x_min, x_max = min(x_data) - margin, max(x_data) + margin
                         y_min, y_max = min(y_data) - margin, max(y_data) + margin
                         z_min, z_max = min(z_data) - margin, max(z_data) + margin
                         
-                        self.ax.set_xlim(x_min, x_max)
-                        self.ax.set_ylim(y_min, y_max)
-                        self.ax.set_zlim(z_min, z_max)
+                        # 找到最大的数据范围
+                        x_range = x_max - x_min
+                        y_range = y_max - y_min
+                        z_range = z_max - z_min
+                        max_range = max(x_range, y_range, z_range)
+                        
+                        # 计算每个轴的中心点
+                        x_center = (x_min + x_max) / 2
+                        y_center = (y_min + y_max) / 2
+                        z_center = (z_min + z_max) / 2
+                        
+                        # 使用最大范围设置所有轴的范围，保持相同的分度值
+                        half_range = max_range / 2
+                        self.ax.set_xlim(x_center - half_range, x_center + half_range)
+                        self.ax.set_ylim(y_center - half_range, y_center + half_range)
+                        self.ax.set_zlim(z_center - half_range, z_center + half_range)
                     
                     # 刷新图形
                     self.fig.canvas.draw()

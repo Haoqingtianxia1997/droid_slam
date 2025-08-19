@@ -45,59 +45,6 @@ def show_image(image):
     cv2.imshow('image', image / 255.0)
     cv2.waitKey(1)
 
-def quaternion_to_rotation_matrix(q):
-    """将四元数转换为旋转矩阵"""
-    w, x, y, z = q.w, q.x, q.y, q.z
-    
-    # 归一化四元数
-    norm = math.sqrt(w*w + x*x + y*y + z*z)
-    if norm == 0:
-        return np.eye(3)
-    
-    w, x, y, z = w/norm, x/norm, y/norm, z/norm
-    
-    # 构造旋转矩阵
-    R = np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
-        [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-        [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
-    ])
-    
-    return R
-
-def calculate_angle_with_xy_plane(quaternion):
-    """
-    计算四元数对应的向量与世界坐标系xy平面的夹角（锐角，0-90度）
-    
-    Args:
-        quaternion: Quaternion消息，包含w, x, y, z
-    
-    Returns:
-        angle_degrees: 与xy平面的锐角夹角（度）
-    """
-    # 获取旋转矩阵
-    R = quaternion_to_rotation_matrix(quaternion)
-    
-    # 假设我们要计算的是z轴方向向量与xy平面的夹角
-    # 旋转后的z轴方向向量是旋转矩阵的第三列
-    z_vector = R[:, 2]  # [x, y, z]分量
-    
-    # xy平面的法向量是 [0, 0, 1]
-    # 计算z_vector与xy平面的夹角
-    # 向量与平面的夹角 = 90° - 向量与平面法向量的夹角
-    
-    # z_vector与xy平面法向量[0,0,1]的夹角
-    cos_angle_with_normal = abs(z_vector[2])  # |z分量| / |向量长度|，由于向量已归一化
-    
-    # 与xy平面的夹角
-    angle_with_plane_rad = math.asin(cos_angle_with_normal)  # arcsin(|z分量|)
-    angle_with_plane_deg = math.degrees(angle_with_plane_rad)
-    
-    # 确保返回锐角（0-90度）
-    if angle_with_plane_deg > 90:
-        angle_with_plane_deg = 180 - angle_with_plane_deg
-    
-    return 90 - angle_with_plane_deg
 
 class DroidSlamNode(Node):
     def __init__(self, rgb_topic, depth_topic, calib_file, args):
@@ -146,6 +93,18 @@ class DroidSlamNode(Node):
         self.quaternion_offset = Quaternion()
         self.current_angle_with_xy_plane = 0.0  # 存储当前与xy平面的夹角
         
+        # 存储第一次接收到的四元数用于补偿
+        self.first_quaternion_received = False
+        self.reference_quaternion = None
+        self.quaternion_lock = threading.Lock()
+        
+        # 确保第一帧图像和四元数的对应关系
+        self.first_frame_processed = False
+        if args.publish_pose:
+            self.wait_for_quaternion = True  # 等待四元数后再处理第一帧
+        else:
+            self.wait_for_quaternion = False  # 如果不发布pose，直接处理图像
+        
         # Store previous pose for velocity calculation
         self.previous_pose = None
         self.previous_time = None
@@ -170,22 +129,32 @@ class DroidSlamNode(Node):
         self.ts.registerCallback(self.synchronized_callback)
     
     def first_quat_callback(self, msg: Quaternion):
-        """处理四元数消息并计算与xy平面的夹角"""
-        self.quaternion_offset.w = msg.w
-        self.quaternion_offset.x = msg.x
-        self.quaternion_offset.y = msg.y
-        self.quaternion_offset.z = msg.z
+        """处理四元数消息并发送torso相对于世界坐标系的四元数"""
+        with self.quaternion_lock:
+            self.quaternion_offset.w = msg.w
+            self.quaternion_offset.x = msg.x
+            self.quaternion_offset.y = msg.y
+            self.quaternion_offset.z = msg.z
+            
+            # 只保存第一次接收到的四元数作为参考
+            if not self.first_quaternion_received:
+                self.reference_quaternion = {
+                    'w': msg.w,
+                    'x': msg.x,
+                    'y': msg.y,
+                    'z': msg.z
+                }
+                self.first_quaternion_received = True
+                self.wait_for_quaternion = False  # 允许开始处理图像
+                self.get_logger().info(f"First quaternion received and saved as reference: w={msg.w:.4f}, x={msg.x:.4f}, y={msg.y:.4f}, z={msg.z:.4f}")
         
-        # 计算与xy平面的锐角夹角
-        self.current_angle_with_xy_plane = calculate_angle_with_xy_plane(msg)
-        
-        # 通过UDP发送角度数据
-        if self.args.publish_pose and self.angle_udp_socket is not None:
-            angle_data = {
-                'angle_with_xy_plane': self.current_angle_with_xy_plane,
+        # 通过UDP发送第一次接收到的四元数数据（用于补偿）
+        if self.args.publish_pose and self.angle_udp_socket is not None and self.reference_quaternion is not None:
+            quaternion_data = {
+                'torso_to_world_quat': self.reference_quaternion,
                 'timestamp': time.time()
             }
-            self._send_angle_data_udp(angle_data)
+            self._send_angle_data_udp(quaternion_data)
         
 
     def _init_udp_receiver(self):
@@ -254,11 +223,6 @@ class DroidSlamNode(Node):
         if trajectory_data is not None and 'latest_position' in trajectory_data:
         
             latest_pos = trajectory_data['latest_position']
-            
-
-
-            
-            # 应用反向旋转补偿
 
             latest_pos = np.array([latest_pos['x'], latest_pos['y'], latest_pos['z']])
 
@@ -266,13 +230,8 @@ class DroidSlamNode(Node):
             pose_msg.header.stamp = stamp
 
             pose_msg.pose.position.x = float(latest_pos[0])  
-            pose_msg.pose.position.y = float(latest_pos[2])  
-            pose_msg.pose.position.z = float(latest_pos[1])  
-
-            pose_msg.pose.orientation.x = 0.0
-            pose_msg.pose.orientation.y = 0.0
-            pose_msg.pose.orientation.z = 0.0
-            pose_msg.pose.orientation.w = 1.0
+            pose_msg.pose.position.y = float(latest_pos[1])  
+            pose_msg.pose.position.z = float(latest_pos[2])  
             
             self.pose_pub.publish(pose_msg)
             
@@ -287,8 +246,8 @@ class DroidSlamNode(Node):
                 dt = current_time - self.previous_time
                 if dt > 0:
                     dx = latest_pos[0] - self.previous_pose[0]
-                    dy = latest_pos[2] - self.previous_pose[2]
-                    dz = latest_pos[1] - self.previous_pose[1]
+                    dy = latest_pos[1] - self.previous_pose[1]
+                    dz = latest_pos[2] - self.previous_pose[2]
 
                     odom_msg.twist.twist.linear.x = dx / dt
                     odom_msg.twist.twist.linear.y = dy / dt
@@ -303,6 +262,11 @@ class DroidSlamNode(Node):
     
    
     def synchronized_callback(self, rgb_msg, depth_msg):
+        # 如果启用了pose发布且还在等待第一个四元数，则跳过图像处理
+        if self.args.publish_pose and self.wait_for_quaternion:
+            self.get_logger().info("Waiting for first quaternion before processing images...")
+            return
+            
         # Convert ROS message to OpenCV format
         rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
         depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
@@ -312,6 +276,15 @@ class DroidSlamNode(Node):
         
         if processed_data is not None:
             t, image_tensor, depth_tensor, intrinsics = processed_data
+            
+            # 记录第一帧处理
+            if not self.first_frame_processed:
+                with self.quaternion_lock:
+                    if self.first_quaternion_received:
+                        self.first_frame_processed = True
+                        self.get_logger().info(f"First frame processed (frame {t}) with reference quaternion established")
+                    else:
+                        self.get_logger().warning("Processing first frame but quaternion not yet received")
             
             # Show image if visualization is enabled
             if not self.args.disable_vis:
