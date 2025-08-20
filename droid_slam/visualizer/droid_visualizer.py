@@ -106,6 +106,105 @@ def merge_depths_and_poses(depth_video1, depth_video2):
 
 
 class DroidVisualizer(OrbitDragCameraWindow):
+    def __init_point_cloud_accumulation(self):
+        """初始化点云累积相关变量"""
+        self.accumulated_points = []
+        self.accumulated_colors = []
+        self.last_save_time = time.time()
+        self.save_interval = 15.0  # 15秒保存一次
+        self.save_counter = 0
+    
+    def accumulate_point_cloud(self):
+        """累积当前帧的点云数据"""
+        try:
+            # 从GPU buffer获取点云和颜色数据
+            points = self.pts_buffer.read()
+            colors = self.clr_buffer.read()
+            valid = self.valid_buffer.read()
+            
+            # 转为numpy数组
+            num_points = len(points) // (3 * 4)  # float32
+            points_np = np.frombuffer(points, dtype=np.float32).reshape(num_points, 3)
+            colors_np = np.frombuffer(colors, dtype=np.float32).reshape(num_points, 3)
+            valid_np = np.frombuffer(valid, dtype=np.float32)
+            
+            # 只保留有效点
+            mask = valid_np > 0
+            valid_points = points_np[mask]
+            valid_colors = colors_np[mask]
+            
+            if len(valid_points) > 0:
+                # 应用相机到世界坐标系的旋转变换
+                if DroidVisualizer._latest_angle_data is not None:
+                    torso_quat_data = DroidVisualizer._latest_angle_data.get('torso_to_world_quat', {})
+                    torso_to_world_quat = np.array([
+                        torso_quat_data.get('w', 1.0),
+                        torso_quat_data.get('x', 0.0),
+                        torso_quat_data.get('y', 0.0),
+                        torso_quat_data.get('z', 0.0)
+                    ])
+                    
+                    # 相机到torso的变换（根据您提供的四元数）
+                    camera_to_torso_quat = np.array([0.45451948, -0.54167522, 0.54167522, -0.45451948])
+                    
+                    # 计算相机到世界坐标系的四元数：camera_to_world = torso_to_world * camera_to_torso
+                    camera_to_world_quat = quaternion_multiply(torso_to_world_quat, camera_to_torso_quat)
+                    
+                    # 将四元数转换为旋转矩阵
+                    R_camera_to_world = quaternion_to_rotation_matrix(
+                        camera_to_world_quat[0], camera_to_world_quat[1], 
+                        camera_to_world_quat[2], camera_to_world_quat[3]
+                    )
+                    
+                    # 对点云应用旋转变换
+                    valid_points = (R_camera_to_world @ valid_points.T).T
+                
+                self.accumulated_points.append(valid_points)
+                self.accumulated_colors.append(valid_colors)
+                
+        except Exception as e:
+            print(f"累积点云失败: {e}")
+    
+    def save_accumulated_point_cloud(self, filename_prefix="accumulated_pointcloud"):
+        """保存累积的点云为PLY文件"""
+        try:
+            if len(self.accumulated_points) == 0:
+                print("没有累积的点云数据可保存")
+                return
+                
+            # 合并所有累积的点云（已经在累积时应用了坐标变换）
+            all_points = np.vstack(self.accumulated_points)
+            all_colors = np.vstack(self.accumulated_colors)
+            
+            # 颜色转为0-255
+            all_colors = (all_colors * 255).astype(np.uint8)
+            
+            # 生成带时间戳的文件名
+            timestamp = int(time.time())
+            filename = f"{filename_prefix}_{timestamp}.ply"
+            
+            # 写PLY文件
+            with open(filename, "w") as f:
+                f.write("ply\nformat ascii 1.0\n")
+                f.write(f"element vertex {all_points.shape[0]}\n")
+                f.write("property float x\nproperty float y\nproperty float z\n")
+                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+                f.write("end_header\n")
+                for p, c in zip(all_points, all_colors):
+                    f.write(f"{p[0]} {p[1]} {p[2]} {c[0]} {c[1]} {c[2]}\n")
+            
+            print(f"累积点云已保存到 {filename}, 总点数: {all_points.shape[0]}")
+            self.save_counter += 1
+            
+        except Exception as e:
+            print(f"保存累积点云失败: {e}")
+    
+    def check_auto_save(self):
+        """检查是否需要自动保存"""
+        current_time = time.time()
+        if current_time - self.last_save_time >= self.save_interval:
+            self.save_accumulated_point_cloud()
+            self.last_save_time = current_time
     title = "Droid Visualizer"
     _depth_video1 = None
     _depth_video2 = None
@@ -130,6 +229,9 @@ class DroidVisualizer(OrbitDragCameraWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.wnd.mouse_exclusivity = False
+        
+        # 初始化点云累积功能
+        self.__init_point_cloud_accumulation()
         
         # 初始化UDP socket
         self._init_udp_socket()
@@ -509,6 +611,12 @@ class DroidVisualizer(OrbitDragCameraWindow):
             self.pts_buffer.write(points.contiguous().cpu().numpy())
             self.clr_buffer.write(colors.contiguous().cpu().numpy())
             self.valid_buffer.write(valid.contiguous().cpu().numpy())
+            
+            # 累积点云数据
+            self.accumulate_point_cloud()
+            
+            # 检查是否需要自动保存
+            self.check_auto_save()
 
         self.count += 1
         self.points.render(mode=moderngl.POINTS)
