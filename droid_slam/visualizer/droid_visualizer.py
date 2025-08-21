@@ -16,6 +16,13 @@ from align import align_pose_fragements
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import threading
+import warnings
+
+# 过滤matplotlib的坐标轴警告
+warnings.filterwarnings("ignore", message=".*fixed x limits to fulfill fixed data aspect.*")
+
+# 添加sklearn用于DBSCAN过滤
+from sklearn.cluster import DBSCAN
 
 # 添加UDP传输相关模块
 import socket
@@ -113,6 +120,10 @@ class DroidVisualizer(OrbitDragCameraWindow):
         self.last_save_time = time.time()
         self.save_interval = 15.0  # 15秒保存一次
         self.save_counter = 0
+        
+        # 存储当前帧的2D点云数据，用于实时可视化
+        self.current_frame_2d_points = None
+        self.current_frame_2d_colors = None
     
     def accumulate_point_cloud(self):
         """累积当前帧的点云数据"""
@@ -158,9 +169,58 @@ class DroidVisualizer(OrbitDragCameraWindow):
                     
                     # 对点云应用旋转变换
                     valid_points = (R_camera_to_world @ valid_points.T).T
+
+                # 1. 按z轴高度过滤点云（保留-0.9到0.75之间的点）
+                z_mask = (valid_points[:, 2] >= -0.9) & (valid_points[:, 2] <= 0.75)
+                filtered_points = valid_points[z_mask]
+                filtered_colors = valid_colors[z_mask]
                 
-                self.accumulated_points.append(valid_points)
-                self.accumulated_colors.append(valid_colors)
+                if len(filtered_points) > 0:
+                    # 2. 投影到xy平面（消除z轴）
+                    xy_points = filtered_points[:, :2]  # 只取x,y坐标
+                    
+                    # 3. 网格降采样
+                    grid_size = 0.05  # 5cm网格大小，可以根据需要调整
+                    
+                    # 计算网格索引
+                    grid_indices = np.floor(xy_points / grid_size).astype(int)
+                    
+                    # 使用字典存储每个网格的点
+                    grid_dict = {}
+                    for i, (grid_x, grid_y) in enumerate(grid_indices):
+                        grid_key = (grid_x, grid_y)
+                        if grid_key not in grid_dict:
+                            grid_dict[grid_key] = []
+                        grid_dict[grid_key].append(i)
+                    
+                    # 对每个网格计算代表点
+                    downsampled_points = []
+                    downsampled_colors = []
+                    
+                    for grid_key, point_indices in grid_dict.items():
+                        # 计算网格中心点坐标（只有xy坐标，z设为0）
+                        grid_center_x = (grid_key[0] + 0.5) * grid_size
+                        grid_center_y = (grid_key[1] + 0.5) * grid_size
+                        
+                        # 计算该网格内所有点的平均颜色
+                        grid_colors = filtered_colors[point_indices]
+                        avg_color = np.mean(grid_colors, axis=0)
+                        
+                        # 创建代表点（使用网格中心的xy坐标，z坐标设为0）
+                        representative_point = np.array([grid_center_x, grid_center_y, 0.0])
+                        
+                        downsampled_points.append(representative_point)
+                        downsampled_colors.append(avg_color)
+                    
+                    if len(downsampled_points) > 0:
+                        downsampled_points = np.array(downsampled_points)
+                        downsampled_colors = np.array(downsampled_colors)
+                        
+                        # 存储当前帧的降采样点云用于2D实时可视化
+                        self.current_frame_2d_points = downsampled_points
+                        self.current_frame_2d_colors = downsampled_colors
+                        
+                        # print(f"降采样：原始点数 {len(filtered_points)} -> 降采样后 {len(downsampled_points)}")
                 
         except Exception as e:
             print(f"累积点云失败: {e}")
@@ -168,16 +228,40 @@ class DroidVisualizer(OrbitDragCameraWindow):
     def save_accumulated_point_cloud(self, filename_prefix="accumulated_pointcloud"):
         """保存累积的点云为PLY文件"""
         try:
-            if len(self.accumulated_points) == 0:
-                print("没有累积的点云数据可保存")
+            if len(self.current_frame_2d_points) == 0:
+                print("没有可保存的点云数据。请先累积点云。")
                 return
                 
             # 合并所有累积的点云（已经在累积时应用了坐标变换）
-            all_points = np.vstack(self.accumulated_points)
-            all_colors = np.vstack(self.accumulated_colors)
+            all_points = self.current_frame_2d_points
+            all_colors = self.current_frame_2d_colors
+            
+            # 去重：使用点的坐标作为唯一标识
+            # 将坐标四舍五入到网格精度来确保一致性
+            grid_size = 0.05  # 与accumulate_point_cloud中的grid_size保持一致
+            rounded_points = np.round(all_points / grid_size) * grid_size
+            
+            # 使用更简单安全的去重方法：基于字符串表示
+            # 将每个点转换为字符串作为唯一键
+            point_strings = [f"{p[0]:.6f},{p[1]:.6f},{p[2]:.6f}" for p in rounded_points]
+            
+            # 创建去重字典
+            unique_dict = {}
+            for i, point_str in enumerate(point_strings):
+                if point_str not in unique_dict:
+                    unique_dict[point_str] = i
+            
+            # 获取唯一点的索引
+            unique_indices = list(unique_dict.values())
+            
+            # 获取去重后的点和颜色
+            unique_points = all_points[unique_indices]
+            unique_colors = all_colors[unique_indices]
             
             # 颜色转为0-255
-            all_colors = (all_colors * 255).astype(np.uint8)
+            unique_colors = (unique_colors * 255).astype(np.uint8)
+            
+            print(f"去重前点数: {len(all_points)}, 去重后点数: {len(unique_points)}")
             
             # 生成带时间戳的文件名
             timestamp = int(time.time())
@@ -186,14 +270,14 @@ class DroidVisualizer(OrbitDragCameraWindow):
             # 写PLY文件
             with open(filename, "w") as f:
                 f.write("ply\nformat ascii 1.0\n")
-                f.write(f"element vertex {all_points.shape[0]}\n")
+                f.write(f"element vertex {unique_points.shape[0]}\n")
                 f.write("property float x\nproperty float y\nproperty float z\n")
                 f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
                 f.write("end_header\n")
-                for p, c in zip(all_points, all_colors):
+                for p, c in zip(unique_points, unique_colors):
                     f.write(f"{p[0]} {p[1]} {p[2]} {c[0]} {c[1]} {c[2]}\n")
             
-            print(f"累积点云已保存到 {filename}, 总点数: {all_points.shape[0]}")
+            print(f"累积点云已保存到 {filename}, 总点数: {unique_points.shape[0]}")
             self.save_counter += 1
             
         except Exception as e:
@@ -225,6 +309,13 @@ class DroidVisualizer(OrbitDragCameraWindow):
     _angle_udp_socket = None
     _angle_udp_port = 12347
     _latest_angle_data = None
+
+    # 2D点云实时可视化配置
+    _enable_2d_plot = True
+    _2d_filter_outliers = False
+    _2d_eps = 0.1
+    _2d_min_samples = 5
+    _2d_point_size = 3.0
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -348,6 +439,14 @@ class DroidVisualizer(OrbitDragCameraWindow):
 
         # 初始化 3D 轨迹可视化
         self._init_3d_trajectory_plot()
+
+        # 初始化 2D 点云实时可视化
+        if self._enable_2d_plot:
+            try:
+                self._init_2d_pointcloud_plot()
+            except Exception as e:
+                print(f"Warning: Failed to initialize 2D visualization: {e}")
+                self._enable_2d_plot = False  # 禁用2D可视化以避免后续错误
 
     def _init_udp_socket(self):
         """初始化UDP socket用于发送轨迹数据"""
@@ -551,6 +650,146 @@ class DroidVisualizer(OrbitDragCameraWindow):
         except Exception as e:
             print(f"Error when updating 3D trajectory from cam_pts: {e}")
 
+    def _init_2d_pointcloud_plot(self):
+        """初始化 2D 点云实时可视化"""
+        try:
+            # 设置 matplotlib 非阻塞模式
+            plt.ion()
+            
+            # 创建 2D 图
+            self.fig_2d = plt.figure(figsize=(12, 10))
+            self.ax_2d = self.fig_2d.add_subplot(111)
+            self.ax_2d.set_title('DROID-SLAM Real-time 2D Point Cloud', fontsize=14)
+            self.ax_2d.set_xlabel('X (m)', fontsize=12)
+            self.ax_2d.set_ylabel('Y (m)', fontsize=12)
+            self.ax_2d.grid(True, alpha=0.3)
+            self.ax_2d.set_aspect('equal', adjustable='box')  # 使用adjustable='box'而不是axis('equal')
+            
+            # 初始化散点图
+            self.pointcloud_scatter = self.ax_2d.scatter([], [], s=self._2d_point_size, alpha=0.6, edgecolors='none', c='blue', label='Point Cloud')
+            
+            # 初始化相机位置点
+            self.camera_position_scatter = self.ax_2d.scatter([], [], s=50, c='red', marker='o', label='Camera Position')
+            
+            # 添加图例
+            self.ax_2d.legend()
+            
+            # 初始化统计信息文本
+            self.info_text_2d = self.ax_2d.text(0.02, 0.98, '', transform=self.ax_2d.transAxes, 
+                                               verticalalignment='top', 
+                                               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            # 存储当前的2D点云数据
+            self.current_2d_points = None
+            self.current_2d_colors = None
+            
+            plt.show(block=False)
+            print("2D point cloud visualization initialized")
+            
+        except Exception as e:
+            print(f"Failed to initialize 2D point cloud plot: {e}")
+
+    def _update_2d_pointcloud(self, points, colors, camera_position=None):
+        """更新实时2D点云可视化
+        
+        Args:
+            points: 点云数据 (N, 3)，将使用x,y坐标
+            colors: 颜色数据 (N, 3)
+            camera_position: 相机在世界坐标系中的位置 (3,)
+        """
+        try:
+            if not self._enable_2d_plot or points is None or len(points) == 0:
+                return
+            
+            # 保存原始数据
+            original_point_count = len(points)
+            filtered_points = points.copy()
+            filtered_colors = colors.copy()
+            
+            # 使用DBSCAN过滤离群点（可选）
+            if self._2d_filter_outliers and len(points) > self._2d_min_samples:
+                # 只对xy坐标进行聚类
+                xy_points = points[:, :2]
+                
+                # 应用DBSCAN聚类
+                dbscan = DBSCAN(eps=self._2d_eps, min_samples=self._2d_min_samples)
+                cluster_labels = dbscan.fit_predict(xy_points)
+                
+                # 过滤掉离群点（标签为-1的点）
+                inlier_mask = cluster_labels != -1
+                filtered_points = points[inlier_mask]
+                filtered_colors = colors[inlier_mask]
+                
+                # 如果DBSCAN过滤掉了所有点，则回退到原始数据
+                if len(filtered_points) == 0:
+                    print("Warning: DBSCAN filtered out all points, using original data")
+                    filtered_points = points.copy()
+                    filtered_colors = colors.copy()
+            
+            # 存储当前数据
+            self.current_2d_points = filtered_points
+            self.current_2d_colors = filtered_colors
+            
+            # 更新散点图数据（只使用x,y坐标）
+            xy_coords = filtered_points[:, :2]
+            
+            # 更新散点图
+            self.pointcloud_scatter.set_offsets(xy_coords)
+            if len(filtered_colors) > 0:
+                self.pointcloud_scatter.set_color(filtered_colors)
+            
+            # 更新相机位置
+            if camera_position is not None:
+                self.camera_position_scatter.set_offsets([[camera_position[0], camera_position[1]]])
+            
+            # 更新统计信息
+            outlier_count = original_point_count - len(filtered_points)
+            x_range = np.max(xy_coords[:, 0]) - np.min(xy_coords[:, 0]) if len(xy_coords) > 0 else 0
+            y_range = np.max(xy_coords[:, 1]) - np.min(xy_coords[:, 1]) if len(xy_coords) > 0 else 0
+            
+            info_text = f"Points: {len(filtered_points)}"
+            if self._2d_filter_outliers and outlier_count > 0:
+                info_text += f" (Original: {original_point_count})"
+            info_text += f"\nX Range: {x_range:.2f}m\nY Range: {y_range:.2f}m"
+            if self._2d_filter_outliers:
+                info_text += f"\nDBSCAN: eps={self._2d_eps}, min_samples={self._2d_min_samples}"
+            
+            self.info_text_2d.set_text(info_text)
+            
+            # 动态调整坐标轴范围
+            if len(xy_coords) > 0:
+                margin = 0.5
+                x_min, x_max = np.min(xy_coords[:, 0]) - margin, np.max(xy_coords[:, 0]) + margin
+                y_min, y_max = np.min(xy_coords[:, 1]) - margin, np.max(xy_coords[:, 1]) + margin
+                
+                # 如果有相机位置，确保相机位置也在视野内
+                if camera_position is not None:
+                    x_min = min(x_min, camera_position[0] - margin)
+                    x_max = max(x_max, camera_position[0] + margin)
+                    y_min = min(y_min, camera_position[1] - margin)
+                    y_max = max(y_max, camera_position[1] + margin)
+                
+                # 计算最大范围以保持等比例
+                x_range = x_max - x_min
+                y_range = y_max - y_min
+                max_range = max(x_range, y_range)
+                
+                # 计算中心点
+                x_center = (x_min + x_max) / 2
+                y_center = (y_min + y_max) / 2
+                
+                # 使用最大范围设置等比例坐标轴
+                half_range = max_range / 2
+                self.ax_2d.set_xlim(x_center - half_range, x_center + half_range)
+                self.ax_2d.set_ylim(y_center - half_range, y_center + half_range)
+            
+            # 刷新图形
+            self.fig_2d.canvas.draw()
+            self.fig_2d.canvas.flush_events()
+            
+        except Exception as e:
+            print(f"Error updating 2D point cloud: {e}")
+
     def on_render(self, time: float, frame_time: float):
         self.ctx.clear(1.0, 1.0, 1.0)
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -576,6 +815,16 @@ class DroidVisualizer(OrbitDragCameraWindow):
             else:
                 disps = self._depth_video1.disps[:t]
                 poses = self._depth_video1.poses[:t]
+            
+            # 检查poses和disps是否包含有效数据
+            if poses.numel() == 0:
+                print("Warning: poses tensor is empty!")
+                self.count += 1
+                return
+            if disps.numel() == 0:
+                print("Warning: disps tensor is empty!")
+                self.count += 1
+                return
 
             # 4x4 homogenous matrix
             cam_pts = torch.from_numpy(CAM_SEGMENTS).cuda()
@@ -617,6 +866,27 @@ class DroidVisualizer(OrbitDragCameraWindow):
             
             # 检查是否需要自动保存
             self.check_auto_save()
+
+            # 更新2D点云可视化
+            if self._enable_2d_plot:
+                try:
+                    # 直接使用accumulate_point_cloud中处理好的降采样点云数据
+                    current_points = getattr(self, 'current_frame_2d_points', None)
+                    current_colors = getattr(self, 'current_frame_2d_colors', None)
+                    
+                    # 获取当前相机位置（从最后一个相机位置）
+                    camera_position = None
+                    if cam_pts.shape[0] > 0 and DroidVisualizer._latest_trajectory_data is not None:
+                        latest_pos = DroidVisualizer._latest_trajectory_data.get('latest_position')
+                        if latest_pos:
+                            camera_position = np.array([latest_pos['x'], latest_pos['y'], latest_pos['z']])
+                    
+                    # 更新2D可视化
+                    self._update_2d_pointcloud(current_points, current_colors, camera_position)
+                except Exception as e:
+                    # 2D可视化错误不应该影响主SLAM流程
+                    print(f"Warning: 2D visualization update failed: {e}")
+                    pass
 
         self.count += 1
         self.points.render(mode=moderngl.POINTS)

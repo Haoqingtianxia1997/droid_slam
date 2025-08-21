@@ -49,27 +49,28 @@ def load_and_visualize_ply(ply_file_path):
     
     # 可选：对点云进行一些预处理
     # 移除离群点
-    pcd, outlier_indices = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    print(f"移除离群点后剩余 {len(pcd.points)} 个点")
+    # pcd, outlier_indices = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    # print(f"移除离群点后剩余 {len(pcd.points)} 个点")
     
     # 基于Z轴高度过滤点云（排除高度大于1.0和小于-0.95的点）
     points = np.asarray(pcd.points)
-    z_filter = (points[:, 2] >= -0.95) & (points[:, 2] <= 1.0)
+    # z_filter = (points[:, 2] >= -0.95) & (points[:, 2] <= 1.0)
     
-    # 如果点云有颜色信息，也需要过滤
-    if len(pcd.colors) > 0:
-        colors = np.asarray(pcd.colors)
-        filtered_colors = colors[z_filter]
-        pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
+    # # 如果点云有颜色信息，也需要过滤
+    # if len(pcd.colors) > 0:
+    #     colors = np.asarray(pcd.colors)
+    #     filtered_colors = colors[z_filter]
+    #     pcd.colors = o3d.utility.Vector3dVector(filtered_colors)
     
-    # 如果点云有法向量，也需要过滤
-    if len(pcd.normals) > 0:
-        normals = np.asarray(pcd.normals)
-        filtered_normals = normals[z_filter]
-        pcd.normals = o3d.utility.Vector3dVector(filtered_normals)
+    # # 如果点云有法向量，也需要过滤
+    # if len(pcd.normals) > 0:
+    #     normals = np.asarray(pcd.normals)
+    #     filtered_normals = normals[z_filter]
+    #     pcd.normals = o3d.utility.Vector3dVector(filtered_normals)
     
-    # 应用Z轴过滤
-    filtered_points = points[z_filter]
+    # # 应用Z轴过滤
+    # filtered_points = points[z_filter]
+    filtered_points = points
     pcd.points = o3d.utility.Vector3dVector(filtered_points)
 
     print(f"Z轴高度过滤（-0.95 <= z <= 1.0）后剩余 {len(pcd.points)} 个点")
@@ -83,13 +84,15 @@ def load_and_visualize_ply(ply_file_path):
     
     # 添加点云和坐标系到场景
     vis.add_geometry(pcd)
+    render_option = vis.get_render_option()
+    render_option.point_size = 5.0  # 增大点的尺寸
+    
     vis.add_geometry(world_frame)
     
     # 设置渲染选项
     render_option = vis.get_render_option()
-    render_option.background_color = np.array([0.1, 0.1, 0.1])  # 深灰色背景
-    render_option.point_size = 1.0
-    
+    render_option.background_color = np.array([1.0, 1.0, 1.0])  # 白色背景
+
     # 设置视角
     view_control = vis.get_view_control()
     view_control.set_front([0.0, 0.0, 1.0])   # 相机朝向
