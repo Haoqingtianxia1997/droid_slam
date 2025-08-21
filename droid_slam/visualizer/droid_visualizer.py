@@ -14,6 +14,7 @@ from align import align_pose_fragements
 
 # 添加 matplotlib 用于 3D 轨迹可视化
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 from mpl_toolkits.mplot3d import Axes3D
 import threading
 import warnings
@@ -117,8 +118,6 @@ def merge_depths_and_poses(depth_video1, depth_video2):
 class DroidVisualizer(OrbitDragCameraWindow):
     def __init_point_cloud_accumulation(self):
         """初始化点云累积相关变量"""
-        self.accumulated_points = []
-        self.accumulated_colors = []
         self.last_save_time = time.time()
         self.save_interval = 15.0  # 15秒保存一次
         self.save_counter = 0
@@ -131,6 +130,10 @@ class DroidVisualizer(OrbitDragCameraWindow):
         self.occupancy_grid = None  # 将根据点云范围动态创建
         self.grid_origin = None     # 网格原点（动态计算）
         self.grid_size = None       # 网格尺寸（动态计算）
+        
+        # Frontier探索相关变量
+        self.explored_grid = None   # 已探索区域网格
+        self.current_exploration_sector = None  # 当前帧的探索扇形区域
     
     def accumulate_point_cloud(self):
         """累积当前帧的点云数据"""
@@ -153,14 +156,15 @@ class DroidVisualizer(OrbitDragCameraWindow):
             
             if len(valid_points) > 0:
                 # 应用相机到世界坐标系的旋转变换
-                if DroidVisualizer._latest_angle_data is not None:
-                    torso_quat_data = DroidVisualizer._latest_angle_data.get('torso_to_world_quat', {})
+                if DroidVisualizer._first_angle_data is not None:
+                    torso_quat_data = DroidVisualizer._first_angle_data.get('torso_to_world_quat', {})
                     torso_to_world_quat = np.array([
                         torso_quat_data.get('w', 1.0),
                         torso_quat_data.get('x', 0.0),
                         torso_quat_data.get('y', 0.0),
                         torso_quat_data.get('z', 0.0)
                     ])
+                    # torso_to_world_quat = np.array([1.0, 0.0, 0.0, 0.0])
                     
                     # 相机到torso的变换（根据您提供的四元数）
                     camera_to_torso_quat = np.array([0.45451948, -0.54167522, 0.54167522, -0.45451948])
@@ -270,9 +274,7 @@ class DroidVisualizer(OrbitDragCameraWindow):
             
             print(f"去重前点数: {len(all_points)}, 去重后点数: {len(unique_points)}")
             
-            # 生成带时间戳的文件名
-            timestamp = int(time.time())
-            filename = f"{filename_prefix}_{timestamp}.ply"
+            filename = f"{filename_prefix}.ply"
             
             # 写PLY文件
             with open(filename, "w") as f:
@@ -290,37 +292,98 @@ class DroidVisualizer(OrbitDragCameraWindow):
         except Exception as e:
             print(f"保存累积点云失败: {e}")
     
-    def create_occupancy_grid_from_points(self, points):
-        """从点云数据创建动态occupancy grid，每个点周围的区域都被标记为占用"""
+    def create_occupancy_grid_from_points(self, points, robot_position=None):
+        """从点云数据创建动态occupancy grid，包括frontier探索功能
+        
+        网格值定义：
+        - 0: 未探索区域 (frontier) - 黑色
+        - 25: 已探索的自由区域 (explored free) - 白色
+        - 50: 安全冗余区域 - 黄色
+        - 75: 当前帧探索扇形区域 (current exploration) - 绿色
+        - 100: 障碍物区域 (occupied) - 红色
+        """
         if points is None or len(points) == 0:
             return
         
-        # 计算点云的边界范围
-        margin = 1.0  # 边界扩展1米
-        x_min = np.min(points[:, 0]) - margin
-        x_max = np.max(points[:, 0]) + margin
-        y_min = np.min(points[:, 1]) - margin
-        y_max = np.max(points[:, 1]) + margin
+        # 使用静态网格范围或动态计算范围
+        if self._use_static_grid_range:
+            # 使用预设的静态范围
+            x_min = self._static_grid_x_min
+            x_max = self._static_grid_x_max
+            y_min = self._static_grid_y_min
+            y_max = self._static_grid_y_max
+        else:
+            # 动态计算点云的边界范围
+            margin = 1.0  # 边界扩展1米
+            x_min = np.min(points[:, 0]) - margin
+            x_max = np.max(points[:, 0]) + margin
+            y_min = np.min(points[:, 1]) - margin
+            y_max = np.max(points[:, 1]) + margin
         
-        # 更新网格原点和尺寸
-        self.grid_origin = np.array([x_min, y_min])
+        # 检查是否需要重新初始化网格
+        if self._use_static_grid_range:
+            # 静态网格模式：只在首次创建时初始化
+            need_reinit = (
+                self.grid_origin is None or 
+                self.grid_size is None
+            )
+        else:
+            # 动态网格模式：当范围扩大时重新初始化
+            need_reinit = (
+                self.grid_origin is None or 
+                self.grid_size is None or
+                x_min < self.grid_origin[0] or
+                y_min < self.grid_origin[1] or
+                x_max > self.grid_origin[0] + self.grid_size[1] * self._occupancy_grid_resolution or
+                y_max > self.grid_origin[1] + self.grid_size[0] * self._occupancy_grid_resolution
+            )
         
-        # 计算网格尺寸（向上取整）
-        grid_width = int(np.ceil((x_max - x_min) / self._occupancy_grid_resolution))
-        grid_height = int(np.ceil((y_max - y_min) / self._occupancy_grid_resolution))
-        self.grid_size = (grid_height, grid_width)  # (rows, cols)
+        # 保存旧的探索状态（在网格重新初始化之前）
+        old_explored_grid = None
+        old_grid_origin = None
+        old_grid_size = None
         
-        # 创建新的占用网格（全部初始化为自由空间）
-        self.occupancy_grid = np.zeros(self.grid_size, dtype=np.uint8)
+        if need_reinit:
+            # 保存旧状态用于迁移
+            if self.explored_grid is not None:
+                old_explored_grid = self.explored_grid.copy()
+                old_grid_origin = self.grid_origin.copy()
+                old_grid_size = self.grid_size
+            
+            # 更新网格原点和尺寸
+            self.grid_origin = np.array([x_min, y_min])
+            
+            # 计算网格尺寸（向上取整）
+            grid_width = int(np.ceil((x_max - x_min) / self._occupancy_grid_resolution))
+            grid_height = int(np.ceil((y_max - y_min) / self._occupancy_grid_resolution))
+            self.grid_size = (grid_height, grid_width)  # (rows, cols)
+            
+            # 创建新的已探索区域网格
+            self.explored_grid = np.zeros(self.grid_size, dtype=np.uint8)
+            
+            # 迁移旧的探索状态到新网格
+            if old_explored_grid is not None and old_grid_origin is not None:
+                self._migrate_exploration_state(old_explored_grid, old_grid_origin, old_grid_size)
+        
+        # 创建临时障碍物网格（只包含当前帧的障碍物信息）
+        temp_obstacle_grid = np.zeros(self.grid_size, dtype=np.uint8)
+        
+        # 重置当前探索扇形区域标记
+        self.current_exploration_sector = np.zeros(self.grid_size, dtype=np.uint8)
         
         # 计算每个点的占用半径对应的网格像素数
         radius_pixels = int(np.ceil(self._occupancy_point_radius / self._occupancy_grid_resolution))
         
-        # 为每个点标记周围的占用区域
+        # 为每个点标记周围的占用区域（存储在临时网格中）
         for point in points:
             # 世界坐标到网格坐标的转换
             grid_x = int((point[0] - self.grid_origin[0]) / self._occupancy_grid_resolution)
             grid_y = int((point[1] - self.grid_origin[1]) / self._occupancy_grid_resolution)
+            
+            # 检查点是否在网格范围内
+            if (grid_x < 0 or grid_x >= self.grid_size[1] or
+                grid_y < 0 or grid_y >= self.grid_size[0]):
+                continue  # 跳过超出范围的点
             
             # 在点周围的区域内标记占用
             for dy in range(-radius_pixels, radius_pixels + 1):
@@ -337,13 +400,13 @@ class DroidVisualizer(OrbitDragCameraWindow):
                         if (0 <= new_grid_x < self.grid_size[1] and 
                             0 <= new_grid_y < self.grid_size[0]):
                             # 标记为占用（100表示完全占用）
-                            self.occupancy_grid[new_grid_y, new_grid_x] = 100
+                            temp_obstacle_grid[new_grid_y, new_grid_x] = 100
         
-        # 应用形态学操作（先腐蚀再膨胀）
-        if self._enable_morphology and np.any(self.occupancy_grid > 0):
+        # 应用形态学操作到临时障碍物网格
+        if self._enable_morphology and np.any(temp_obstacle_grid > 50):
             try:
                 # 将占用网格转换为二值图像（0或1）
-                binary_grid = (self.occupancy_grid > 50).astype(bool)
+                binary_grid = (temp_obstacle_grid > 50).astype(bool)
                 
                 # 创建结构元素（形态学操作核）
                 kernel_size = self._morphology_kernel_size
@@ -359,18 +422,18 @@ class DroidVisualizer(OrbitDragCameraWindow):
                     for _ in range(self._dilation_iterations):
                         binary_grid = binary_dilation(binary_grid, structure=kernel)
                 
-                # 将二值结果转换回占用网格
-                self.occupancy_grid = (binary_grid * 100).astype(np.uint8)
+                # 将二值结果转换回临时障碍物网格
+                temp_obstacle_grid = (binary_grid * 100).astype(np.uint8)
                 
             except Exception as e:
                 print(f"Warning: Morphological operations failed: {e}")
-                # 如果形态学操作失败，继续使用原始网格
         
-        # 添加安全冗余区域
-        if self._enable_safety_margin and np.any(self.occupancy_grid > 50):
+        # 添加安全冗余区域到临时障碍物网格
+        temp_safety_grid = np.zeros(self.grid_size, dtype=np.uint8)
+        if self._enable_safety_margin and np.any(temp_obstacle_grid > 50):
             try:
                 # 获取当前的障碍物区域
-                obstacle_mask = (self.occupancy_grid > 50)
+                obstacle_mask = (temp_obstacle_grid > 50)
                 
                 # 计算安全冗余距离对应的像素数
                 safety_margin_pixels = int(np.ceil(self._safety_margin_distance / self._occupancy_grid_resolution))
@@ -383,19 +446,167 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 # 对障碍物区域进行膨胀，生成安全冗余区域
                 safety_margin_mask = binary_dilation(obstacle_mask, structure=circular_mask)
                 
-                # 创建新的占用网格，包含三种状态：
-                # 100 = 完全占用（障碍物）
-                # 50 = 安全冗余区域（浅色）
-                # 0 = 自由空间
-                new_occupancy_grid = np.zeros_like(self.occupancy_grid)
-                new_occupancy_grid[safety_margin_mask] = 50  # 安全冗余区域
-                new_occupancy_grid[obstacle_mask] = 100      # 障碍物区域（覆盖冗余区域）
-                
-                self.occupancy_grid = new_occupancy_grid
+                # 创建安全冗余区域网格（不包含障碍物区域本身）
+                safety_only_mask = safety_margin_mask & (~obstacle_mask)
+                temp_safety_grid[safety_only_mask] = 50  # 安全冗余区域
                 
             except Exception as e:
                 print(f"Warning: Safety margin generation failed: {e}")
-                # 如果冗余区域生成失败，继续使用现有网格
+        
+        # 应用frontier探索功能（在障碍物和安全区域确定之后）
+        if self._enable_frontier_exploration and robot_position is not None:
+            self._update_frontier_exploration(robot_position, temp_obstacle_grid, temp_safety_grid)
+        
+        # 最后合并所有层到最终的占用网格
+        self._merge_exploration_layers(temp_obstacle_grid, temp_safety_grid)
+    
+    def _migrate_exploration_state(self, old_explored_grid, old_grid_origin, old_grid_size):
+        """将旧网格的探索状态迁移到新网格"""
+        try:
+            # 计算新网格和旧网格的坐标对应关系
+            for old_y in range(old_grid_size[0]):
+                for old_x in range(old_grid_size[1]):
+                    if old_explored_grid[old_y, old_x] == 1:  # 如果旧网格中该位置已探索
+                        # 将旧网格坐标转换为世界坐标
+                        world_x = old_grid_origin[0] + old_x * self._occupancy_grid_resolution
+                        world_y = old_grid_origin[1] + old_y * self._occupancy_grid_resolution
+                        
+                        # 将世界坐标转换为新网格坐标
+                        new_x = int((world_x - self.grid_origin[0]) / self._occupancy_grid_resolution)
+                        new_y = int((world_y - self.grid_origin[1]) / self._occupancy_grid_resolution)
+                        
+                        # 检查新坐标是否在新网格范围内
+                        if (0 <= new_x < self.grid_size[1] and 
+                            0 <= new_y < self.grid_size[0]):
+                            self.explored_grid[new_y, new_x] = 1
+                            
+        except Exception as e:
+            print(f"Warning: Failed to migrate exploration state: {e}")
+    
+    def _update_frontier_exploration(self, robot_position, obstacle_grid, safety_grid):
+        """更新frontier探索区域
+        
+        Args:
+            robot_position: 机器人在世界坐标系中的位置 [x, y, z]
+            obstacle_grid: 障碍物网格
+            safety_grid: 安全冗余区域网格
+        """
+        try:
+            if self.grid_origin is None or self.grid_size is None:
+                return
+            
+            # 机器人在网格中的位置
+            robot_grid_x = int((robot_position[0] - self.grid_origin[0]) / self._occupancy_grid_resolution)
+            robot_grid_y = int((robot_position[1] - self.grid_origin[1]) / self._occupancy_grid_resolution)
+            
+            # 检查机器人位置是否在网格范围内
+            if (robot_grid_x < 0 or robot_grid_x >= self.grid_size[1] or
+                robot_grid_y < 0 or robot_grid_y >= self.grid_size[0]):
+                return
+            
+            # 获取机器人朝向
+            robot_heading = 0.0  # 默认朝向（弧度），0表示朝向正x方向
+            
+            # 尝试从角度数据中获取机器人朝向
+            if DroidVisualizer._latest_angle_data is not None:
+                # 从torso四元数计算yaw角（绕z轴旋转）
+                torso_quat_data = DroidVisualizer._latest_angle_data.get('torso_to_world_quat', {})
+                if torso_quat_data:
+                    w = torso_quat_data.get('w', 1.0)
+                    x = torso_quat_data.get('x', 0.0)
+                    y = torso_quat_data.get('y', 0.0)
+                    z = torso_quat_data.get('z', 0.0)
+                    
+                    # 从四元数计算yaw角（假设是标准的ZYX欧拉角顺序）
+                    # yaw = arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+                    robot_heading = np.arctan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+                    
+                    # 考虑相机到torso的朝向偏移（如果需要的话）
+                    # 这里可能需要根据实际的相机安装方向进行调整
+            
+            # 计算探索扇形的角度范围
+            sector_angle_rad = np.deg2rad(self._exploration_sector_angle)
+            start_angle = robot_heading - sector_angle_rad / 2
+            end_angle = robot_heading + sector_angle_rad / 2
+            
+            # 计算探索半径对应的像素数
+            radius_pixels = int(self._exploration_sector_radius / self._occupancy_grid_resolution)
+            
+            # 生成射线
+            ray_angles = np.arange(start_angle, end_angle, np.deg2rad(self._exploration_ray_resolution))
+            
+            for angle in ray_angles:
+                # 计算射线方向
+                dx = np.cos(angle)
+                dy = np.sin(angle)
+                
+                # 沿射线方向步进
+                for step in range(1, radius_pixels + 1):
+                    # 计算当前点的网格坐标
+                    current_x = robot_grid_x + int(step * dx)
+                    current_y = robot_grid_y + int(step * dy)
+                    
+                    # 检查是否超出网格边界
+                    if (current_x < 0 or current_x >= self.grid_size[1] or
+                        current_y < 0 or current_y >= self.grid_size[0]):
+                        break
+                    
+                    # 检查是否遇到障碍物或安全冗余区域
+                    if (obstacle_grid[current_y, current_x] >= 100 or 
+                        safety_grid[current_y, current_x] >= 50):  # 障碍物或冗余区域
+                        break
+                    
+                    # 标记当前探索区域
+                    self.current_exploration_sector[current_y, current_x] = 1
+                    
+                    # 将该点标记为已探索
+                    self.explored_grid[current_y, current_x] = 1
+            
+        except Exception as e:
+            print(f"Warning: Frontier exploration update failed: {e}")
+    
+    def _merge_exploration_layers(self, obstacle_grid, safety_grid):
+        """合并所有探索层到最终的占用网格中
+        
+        Args:
+            obstacle_grid: 障碍物网格
+            safety_grid: 安全冗余区域网格
+            
+        网格值定义：
+        - 0: 未探索区域 (frontier) - 黑色
+        - 25: 已探索的自由区域 (explored free) - 白色
+        - 50: 安全冗余区域 - 黄色
+        - 75: 当前帧探索扇形区域 - 绿色
+        - 100: 障碍物区域 (occupied) - 红色
+        """
+        try:
+            # 获取各种掩码
+            obstacle_mask = (obstacle_grid >= 100)
+            safety_margin_mask = (safety_grid >= 50)
+            current_exploration_mask = (self.current_exploration_sector == 1)
+            explored_mask = (self.explored_grid == 1)
+            
+            # 重新构建占用网格，按优先级从低到高
+            # 1. 默认为未探索frontier区域 (0)
+            final_grid = np.zeros(self.grid_size, dtype=np.uint8)
+            
+            # 2. 已探索的自由区域 (25)
+            final_grid[explored_mask] = 25
+            
+            # 3. 安全冗余区域 (50) - 覆盖已探索区域
+            final_grid[safety_margin_mask] = 50
+            
+            # 4. 当前帧探索区域 (75) - 只在非障碍物非安全区域显示
+            exploration_free_mask = current_exploration_mask & (~obstacle_mask) & (~safety_margin_mask)
+            final_grid[exploration_free_mask] = 75
+            
+            # 5. 障碍物区域 (100) - 最高优先级，覆盖所有其他区域
+            final_grid[obstacle_mask] = 100
+            
+            self.occupancy_grid = final_grid
+            
+        except Exception as e:
+            print(f"Warning: Failed to merge exploration layers: {e}")
     
     def check_auto_save(self):
         """检查是否需要自动保存"""
@@ -423,7 +634,9 @@ class DroidVisualizer(OrbitDragCameraWindow):
     _angle_udp_socket = None
     _angle_udp_port = 12347
     _latest_angle_data = None
-
+    _first_angle_data = None
+    _first_recieved_angle_data = False
+    
     # 2D点云实时可视化配置
     _enable_2d_plot = True
     _2d_filter_outliers = False
@@ -445,6 +658,19 @@ class DroidVisualizer(OrbitDragCameraWindow):
     # 冗余区域配置
     _enable_safety_margin = True     # 启用安全冗余区域
     _safety_margin_distance = 0.3   # 安全冗余距离（米）
+    
+    # Frontier探索配置
+    _enable_frontier_exploration = True  # 启用frontier探索功能
+    _exploration_sector_angle = 60       # 探索扇形角度（度）
+    _exploration_sector_radius = 5.0     # 探索扇形半径（米）
+    _exploration_ray_resolution = 0.02   # 射线分辨率（角度）
+    
+    # 静态网格范围配置
+    _static_grid_x_min = -25.0           # 静态网格X方向最小值（米）
+    _static_grid_x_max = 15.0            # 静态网格X方向最大值（米）
+    _static_grid_y_min = -20.0           # 静态网格Y方向最小值（米）
+    _static_grid_y_max = 20.0            # 静态网格Y方向最大值（米）
+    _use_static_grid_range = True        # 启用静态网格范围
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -619,8 +845,12 @@ class DroidVisualizer(OrbitDragCameraWindow):
                     data, addr = DroidVisualizer._angle_udp_socket.recvfrom(1024)
                     json_data = data.decode('utf-8')
                     quaternion_data = json.loads(json_data)
+        
+                    if  not DroidVisualizer._first_recieved_angle_data:
+                        DroidVisualizer._first_angle_data = quaternion_data
+                        DroidVisualizer._first_recieved_angle_data = True
+                        
                     DroidVisualizer._latest_angle_data = quaternion_data
-                    # print(f"Received quaternion data: {quaternion_data}")
             except socket.timeout:
                 pass
             except Exception as e:
@@ -689,14 +919,15 @@ class DroidVisualizer(OrbitDragCameraWindow):
                         camera_center_slam = np.mean(cam_pts_reshaped[frame_idx, :, :], axis=0)  # SLAM坐标系中的相机位置
                         
         
-                        if DroidVisualizer._latest_angle_data is not None:
-                            torso_quat_data = DroidVisualizer._latest_angle_data.get('torso_to_world_quat', {})
+                        if DroidVisualizer._first_angle_data is not None:
+                            torso_quat_data = DroidVisualizer._first_angle_data.get('torso_to_world_quat', {})
                             torso_to_world_quat = np.array([
                                 torso_quat_data.get('w', 1.0),
                                 torso_quat_data.get('x', 0.0),
                                 torso_quat_data.get('y', 0.0),
                                 torso_quat_data.get('z', 0.0)
                             ])
+                            # torso_to_world_quat = np.array([1.0, 0.0, 0.0, 0.0])  # 默认四元数（无旋转）
                         
                         # 相机到torso的变换（根据您提供的四元数）
                         camera_to_torso_quat = np.array([0.45451948, -0.54167522, 0.54167522, -0.45451948])
@@ -945,12 +1176,18 @@ class DroidVisualizer(OrbitDragCameraWindow):
             self.occupancy_image = None
             
             # 添加网格
-            self.ax_occupancy.grid(True, alpha=0.3)
+            # self.ax_occupancy.grid(True, alpha=0.3)
+            self.ax_occupancy.grid(False)
             
             # 初始化机器人位置点
             self.robot_position_scatter = self.ax_occupancy.scatter(
                 [], [], s=100, c='red', marker='o', label='Robot Position', zorder=5
             )
+            
+            # 添加探索扇形可视化（可选）
+            if self._enable_frontier_exploration:
+                # 可以在这里添加扇形边界的可视化，但先保持简单
+                pass
             
             self.ax_occupancy.legend()
             
@@ -968,7 +1205,7 @@ class DroidVisualizer(OrbitDragCameraWindow):
             print(f"Failed to initialize occupancy grid plot: {e}")
 
     def _update_occupancy_grid_plot(self, points, robot_position=None):
-        """更新Occupancy Grid可视化（动态范围，仿照2D点云的更新模式）
+        """更新Occupancy Grid可视化（支持frontier探索功能）
         
         Args:
             points: 点云数据 (N, 3)，将使用x,y坐标
@@ -978,8 +1215,8 @@ class DroidVisualizer(OrbitDragCameraWindow):
             if not self._enable_occupancy_grid or points is None or len(points) == 0:
                 return
             
-            # 从点云创建动态occupancy grid
-            self.create_occupancy_grid_from_points(points)
+            # 从点云创建动态occupancy grid（包括frontier探索）
+            self.create_occupancy_grid_from_points(points, robot_position)
             
             # 如果网格还没有创建，退出
             if self.occupancy_grid is None or self.grid_origin is None:
@@ -999,65 +1236,121 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 if self.occupancy_image is not None:
                     self.occupancy_image.remove()
                 
+                # 创建自定义色彩映射用于frontier探索
+                
+                # 定义颜色：
+                # 0: 未探索区域(frontier) - 黑色
+                # 25: 已探索自由区域 - 白色
+                # 50: 安全冗余区域 - 黄色  
+                # 75: 当前探索扇形区域 - 绿色
+                # 100: 障碍物 - 红色
+                colors = ['black', 'white', 'yellow', 'lightgreen', 'red']
+                values = [0, 25, 50, 75, 100]
+                
+                # 创建自定义颜色映射
+                cmap = mcolors.ListedColormap(colors)
+                norm = mcolors.BoundaryNorm([-0.5, 12.5, 37.5, 62.5, 87.5, 100.5], cmap.N)
+                
                 # 创建新的占用网格图像
                 self.occupancy_image = self.ax_occupancy.imshow(
                     self.occupancy_grid, 
-                    cmap='RdYlBu_r',  # 使用红-黄-蓝反向色彩映射：红色=障碍物，黄色=冗余区域，蓝色=自由空间
+                    cmap=cmap,
+                    norm=norm,
                     origin='lower',
                     extent=[x_extent[0], x_extent[1], y_extent[0], y_extent[1]],
-                    vmin=0, vmax=100
+                    interpolation='none',
+                    resample=False
                 )
                 
                 # 重新添加colorbar（如果还没有）
                 if not hasattr(self, 'occupancy_colorbar') or self.occupancy_colorbar is None:
-                    self.occupancy_colorbar = plt.colorbar(self.occupancy_image, ax=self.ax_occupancy)
-                    self.occupancy_colorbar.set_label('Occupancy (0=free, 50=safety margin, 100=occupied)', fontsize=12)
+                    self.occupancy_colorbar = plt.colorbar(
+                        self.occupancy_image, ax=self.ax_occupancy,
+                        ticks=[0, 25, 50, 75, 100],
+                        format='%d'
+                    )
+                    # self.occupancy_colorbar.set_label(
+                    #     'Occupancy\n0=Frontier(Black), 25=Explored(White), 50=Safety(Yellow), 75=Current(Green), 100=Occupied(Red)', 
+                    #     fontsize=10
+                    # )
+                    # 设置colorbar标签
+                    self.occupancy_colorbar.ax.set_yticklabels([
+                        'Frontier', 'Explored', 'Safety', 'Current', 'Occupied'
+                    ])
             else:
                 # 更新现有图像的数据和范围
                 self.occupancy_image.set_array(self.occupancy_grid)
                 self.occupancy_image.set_extent([x_extent[0], x_extent[1], y_extent[0], y_extent[1]])
             
-            # 动态调整坐标轴范围（类似2D点云）
-            margin = 0.5
-            self.ax_occupancy.set_xlim(x_extent[0] - margin, x_extent[1] + margin)
-            self.ax_occupancy.set_ylim(y_extent[0] - margin, y_extent[1] + margin)
+            # 动态调整坐标轴范围
+            if self._use_static_grid_range:
+                # 使用静态网格范围
+                margin = 0.5
+                self.ax_occupancy.set_xlim(self._static_grid_x_min - margin, self._static_grid_x_max + margin)
+                self.ax_occupancy.set_ylim(self._static_grid_y_min - margin, self._static_grid_y_max + margin)
+            else:
+                # 动态调整坐标轴范围（类似2D点云）
+                margin = 0.5
+                self.ax_occupancy.set_xlim(x_extent[0] - margin, x_extent[1] + margin)
+                self.ax_occupancy.set_ylim(y_extent[0] - margin, y_extent[1] + margin)
             
             # 更新机器人位置
             if robot_position is not None:
                 self.robot_position_scatter.set_offsets([[robot_position[0], robot_position[1]]])
             
-            # 更新统计信息
-            occupied_cells = np.sum(self.occupancy_grid == 100)      # 完全占用
-            safety_margin_cells = np.sum(self.occupancy_grid == 50)  # 安全冗余区域
-            free_cells = np.sum(self.occupancy_grid == 0)            # 自由空间
-            total_cells = self.occupancy_grid.size
+            # # 更新统计信息（支持frontier探索）
+            # frontier_cells = np.sum(self.occupancy_grid == 0)       # 未探索区域
+            # explored_cells = np.sum(self.occupancy_grid == 25)      # 已探索自由区域
+            # safety_margin_cells = np.sum(self.occupancy_grid == 50) # 安全冗余区域
+            # current_exploration_cells = np.sum(self.occupancy_grid == 75)  # 当前探索区域
+            # occupied_cells = np.sum(self.occupancy_grid == 100)     # 障碍物
+            # total_cells = self.occupancy_grid.size
             
-            occupied_ratio = occupied_cells / total_cells * 100
-            safety_ratio = safety_margin_cells / total_cells * 100
-            free_ratio = free_cells / total_cells * 100
+            # # 计算百分比
+            # frontier_ratio = frontier_cells / total_cells * 100
+            # explored_ratio = explored_cells / total_cells * 100
+            # safety_ratio = safety_margin_cells / total_cells * 100
+            # current_exploration_ratio = current_exploration_cells / total_cells * 100
+            # occupied_ratio = occupied_cells / total_cells * 100
             
-            info_text = f"Occupied: {occupied_cells} ({occupied_ratio:.1f}%)"
-            info_text += f"\nSafety Margin: {safety_margin_cells} ({safety_ratio:.1f}%)"
-            info_text += f"\nFree: {free_cells} ({free_ratio:.1f}%)"
-            info_text += f"\nTotal: {total_cells}"
-            info_text += f"\nResolution: {self._occupancy_grid_resolution}m/pixel"
-            info_text += f"\nGrid Size: {self.grid_size[1]}x{self.grid_size[0]}"
-            info_text += f"\nCoverage: {self.grid_size[1]*self._occupancy_grid_resolution:.1f}m x {self.grid_size[0]*self._occupancy_grid_resolution:.1f}m"
-            info_text += f"\nPoint Radius: {self._occupancy_point_radius}m"
+            # # 构建信息文本
+            # info_text = f"Frontier(Black): {frontier_cells} ({frontier_ratio:.1f}%)"
+            # info_text += f"\nExplored(White): {explored_cells} ({explored_ratio:.1f}%)"
+            # info_text += f"\nSafety(Yellow): {safety_margin_cells} ({safety_ratio:.1f}%)"
+            # info_text += f"\nCurrent(Green): {current_exploration_cells} ({current_exploration_ratio:.1f}%)"
+            # info_text += f"\nOccupied(Red): {occupied_cells} ({occupied_ratio:.1f}%)"
+            # info_text += f"\nTotal: {total_cells}"
+            # info_text += f"\nResolution: {self._occupancy_grid_resolution}m/pixel"
+            # info_text += f"\nGrid Size: {self.grid_size[1]}x{self.grid_size[0]}"
             
-            # 添加形态学操作信息
-            if self._enable_morphology:
-                info_text += f"\nMorphology: E{self._erosion_iterations}→D{self._dilation_iterations} (K={self._morphology_kernel_size})"
-            else:
-                info_text += f"\nMorphology: Disabled"
+            # # 显示网格范围信息
+            # if self._use_static_grid_range:
+            #     info_text += f"\nStatic Range: X[{self._static_grid_x_min},{self._static_grid_x_max}] Y[{self._static_grid_y_min},{self._static_grid_y_max}]"
+            #     info_text += f"\nCoverage: {self._static_grid_x_max-self._static_grid_x_min:.1f}m x {self._static_grid_y_max-self._static_grid_y_min:.1f}m"
+            # else:
+            #     info_text += f"\nDynamic Range: {self.grid_size[1]*self._occupancy_grid_resolution:.1f}m x {self.grid_size[0]*self._occupancy_grid_resolution:.1f}m"
             
-            # 添加安全冗余区域信息
-            if self._enable_safety_margin:
-                info_text += f"\nSafety Margin: {self._safety_margin_distance}m"
-            else:
-                info_text += f"\nSafety Margin: Disabled"
+            # # 添加探索参数信息
+            # if self._enable_frontier_exploration:
+            #     info_text += f"\nExploration Sector: {self._exploration_sector_angle}°"
+            #     info_text += f"\nExploration Radius: {self._exploration_sector_radius}m"
+            #     info_text += f"\nRay Resolution: {self._exploration_ray_resolution}°"
+            # else:
+            #     info_text += f"\nFrontier Exploration: Disabled"
             
-            self.info_text_occupancy.set_text(info_text)
+            # # 添加形态学操作信息
+            # if self._enable_morphology:
+            #     info_text += f"\nMorphology: E{self._erosion_iterations}→D{self._dilation_iterations} (K={self._morphology_kernel_size})"
+            # else:
+            #     info_text += f"\nMorphology: Disabled"
+            
+            # # 添加安全冗余区域信息
+            # if self._enable_safety_margin:
+            #     info_text += f"\nSafety Margin: {self._safety_margin_distance}m"
+            # else:
+            #     info_text += f"\nSafety Margin: Disabled"
+            
+            # self.info_text_occupancy.set_text(info_text)
             
             # 刷新图形
             self.fig_occupancy.canvas.draw()

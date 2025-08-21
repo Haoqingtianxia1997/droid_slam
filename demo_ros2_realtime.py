@@ -55,6 +55,8 @@ class DroidSlamNode(Node):
         self.droid = None
         self.frame_count = 0
         
+        self.idx = 0
+        
         # UDP接收器相关
         self.udp_socket = None
         self.latest_trajectory_data = None
@@ -96,6 +98,7 @@ class DroidSlamNode(Node):
         # 存储第一次接收到的四元数用于补偿
         self.first_quaternion_received = False
         self.reference_quaternion = None
+        self.quaternion = None
         self.quaternion_lock = threading.Lock()
         
         # 确保第一帧图像和四元数的对应关系
@@ -136,24 +139,23 @@ class DroidSlamNode(Node):
             self.quaternion_offset.y = msg.y
             self.quaternion_offset.z = msg.z
             
-            # 只保存第一次接收到的四元数作为参考
-            if not self.first_quaternion_received:
-                self.reference_quaternion = {
-                    'w': msg.w,
-                    'x': msg.x,
-                    'y': msg.y,
-                    'z': msg.z
-                }
-                self.first_quaternion_received = True
-                self.wait_for_quaternion = False  # 允许开始处理图像
-                self.get_logger().info(f"First quaternion received and saved as reference: w={msg.w:.4f}, x={msg.x:.4f}, y={msg.y:.4f}, z={msg.z:.4f}")
-        
-        # 通过UDP发送第一次接收到的四元数数据（用于补偿）
-        if self.args.publish_pose and self.angle_udp_socket is not None and self.reference_quaternion is not None:
-            quaternion_data = {
-                'torso_to_world_quat': self.reference_quaternion,
-                'timestamp': time.time()
+
+            self.quaternion = {
+                'w': msg.w,
+                'x': msg.x,
+                'y': msg.y,
+                'z': msg.z
             }
+        # 通过UDP发送第一次接收到的四元数数据（用于补偿）
+        if self.args.publish_pose and self.angle_udp_socket is not None and self.quaternion is not None:
+            quaternion_data = {
+                'torso_to_world_quat': self.quaternion,
+                'timestamp': self.idx
+            }
+            self.idx += 1
+            if self.idx > 0:
+                self.first_quaternion_received = True
+                self.wait_for_quaternion = False
             self._send_angle_data_udp(quaternion_data)
         
 

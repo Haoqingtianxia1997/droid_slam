@@ -156,3 +156,4 @@ data
 figures/*.pdf
 
 
+accumulated_pointcloud.ply
