@@ -24,6 +24,9 @@ warnings.filterwarnings("ignore", message=".*fixed x limits to fulfill fixed dat
 # 添加sklearn用于DBSCAN过滤
 from sklearn.cluster import DBSCAN
 
+# 添加形态学操作
+from scipy.ndimage import binary_erosion, binary_dilation
+
 # 添加UDP传输相关模块
 import socket
 import json
@@ -45,7 +48,6 @@ CAM_POINTS = 0.05 * np.array(
 CAM_LINES = np.array(
     [[1, 2], [2, 3], [3, 4], [4, 1], [1, 0], [0, 2], [3, 0], [0, 4], [5, 7], [7, 6]]
 )
-
 
 CAM_SEGMENTS = []
 for i, j in CAM_LINES:
@@ -124,6 +126,11 @@ class DroidVisualizer(OrbitDragCameraWindow):
         # 存储当前帧的2D点云数据，用于实时可视化
         self.current_frame_2d_points = None
         self.current_frame_2d_colors = None
+        
+        # Occupancy Grid相关变量（动态大小）
+        self.occupancy_grid = None  # 将根据点云范围动态创建
+        self.grid_origin = None     # 网格原点（动态计算）
+        self.grid_size = None       # 网格尺寸（动态计算）
     
     def accumulate_point_cloud(self):
         """累积当前帧的点云数据"""
@@ -170,8 +177,8 @@ class DroidVisualizer(OrbitDragCameraWindow):
                     # 对点云应用旋转变换
                     valid_points = (R_camera_to_world @ valid_points.T).T
 
-                # 1. 按z轴高度过滤点云（保留-0.9到0.75之间的点）
-                z_mask = (valid_points[:, 2] >= -0.9) & (valid_points[:, 2] <= 0.75)
+                # 1. 按z轴高度过滤点云（保留-0.8到0.5之间的点）
+                z_mask = (valid_points[:, 2] >= -0.8) & (valid_points[:, 2] <= 0.5)
                 filtered_points = valid_points[z_mask]
                 filtered_colors = valid_colors[z_mask]
                 
@@ -283,6 +290,113 @@ class DroidVisualizer(OrbitDragCameraWindow):
         except Exception as e:
             print(f"保存累积点云失败: {e}")
     
+    def create_occupancy_grid_from_points(self, points):
+        """从点云数据创建动态occupancy grid，每个点周围的区域都被标记为占用"""
+        if points is None or len(points) == 0:
+            return
+        
+        # 计算点云的边界范围
+        margin = 1.0  # 边界扩展1米
+        x_min = np.min(points[:, 0]) - margin
+        x_max = np.max(points[:, 0]) + margin
+        y_min = np.min(points[:, 1]) - margin
+        y_max = np.max(points[:, 1]) + margin
+        
+        # 更新网格原点和尺寸
+        self.grid_origin = np.array([x_min, y_min])
+        
+        # 计算网格尺寸（向上取整）
+        grid_width = int(np.ceil((x_max - x_min) / self._occupancy_grid_resolution))
+        grid_height = int(np.ceil((y_max - y_min) / self._occupancy_grid_resolution))
+        self.grid_size = (grid_height, grid_width)  # (rows, cols)
+        
+        # 创建新的占用网格（全部初始化为自由空间）
+        self.occupancy_grid = np.zeros(self.grid_size, dtype=np.uint8)
+        
+        # 计算每个点的占用半径对应的网格像素数
+        radius_pixels = int(np.ceil(self._occupancy_point_radius / self._occupancy_grid_resolution))
+        
+        # 为每个点标记周围的占用区域
+        for point in points:
+            # 世界坐标到网格坐标的转换
+            grid_x = int((point[0] - self.grid_origin[0]) / self._occupancy_grid_resolution)
+            grid_y = int((point[1] - self.grid_origin[1]) / self._occupancy_grid_resolution)
+            
+            # 在点周围的区域内标记占用
+            for dy in range(-radius_pixels, radius_pixels + 1):
+                for dx in range(-radius_pixels, radius_pixels + 1):
+                    # 计算距离点中心的距离
+                    distance = np.sqrt(dx*dx + dy*dy) * self._occupancy_grid_resolution
+                    
+                    # 如果在占用半径内
+                    if distance <= self._occupancy_point_radius:
+                        new_grid_x = grid_x + dx
+                        new_grid_y = grid_y + dy
+                        
+                        # 检查是否在网格范围内
+                        if (0 <= new_grid_x < self.grid_size[1] and 
+                            0 <= new_grid_y < self.grid_size[0]):
+                            # 标记为占用（100表示完全占用）
+                            self.occupancy_grid[new_grid_y, new_grid_x] = 100
+        
+        # 应用形态学操作（先腐蚀再膨胀）
+        if self._enable_morphology and np.any(self.occupancy_grid > 0):
+            try:
+                # 将占用网格转换为二值图像（0或1）
+                binary_grid = (self.occupancy_grid > 50).astype(bool)
+                
+                # 创建结构元素（形态学操作核）
+                kernel_size = self._morphology_kernel_size
+                kernel = np.ones((kernel_size, kernel_size), dtype=bool)
+                
+                # 先腐蚀（去除小噪声点和细小连接）
+                if self._erosion_iterations > 0:
+                    for _ in range(self._erosion_iterations):
+                        binary_grid = binary_erosion(binary_grid, structure=kernel)
+                
+                # 再膨胀（恢复大小并平滑边缘）
+                if self._dilation_iterations > 0:
+                    for _ in range(self._dilation_iterations):
+                        binary_grid = binary_dilation(binary_grid, structure=kernel)
+                
+                # 将二值结果转换回占用网格
+                self.occupancy_grid = (binary_grid * 100).astype(np.uint8)
+                
+            except Exception as e:
+                print(f"Warning: Morphological operations failed: {e}")
+                # 如果形态学操作失败，继续使用原始网格
+        
+        # 添加安全冗余区域
+        if self._enable_safety_margin and np.any(self.occupancy_grid > 50):
+            try:
+                # 获取当前的障碍物区域
+                obstacle_mask = (self.occupancy_grid > 50)
+                
+                # 计算安全冗余距离对应的像素数
+                safety_margin_pixels = int(np.ceil(self._safety_margin_distance / self._occupancy_grid_resolution))
+                
+                # 创建圆形结构元素用于膨胀操作
+                y_coords, x_coords = np.ogrid[:2*safety_margin_pixels+1, :2*safety_margin_pixels+1]
+                center = safety_margin_pixels
+                circular_mask = ((x_coords - center)**2 + (y_coords - center)**2) <= safety_margin_pixels**2
+                
+                # 对障碍物区域进行膨胀，生成安全冗余区域
+                safety_margin_mask = binary_dilation(obstacle_mask, structure=circular_mask)
+                
+                # 创建新的占用网格，包含三种状态：
+                # 100 = 完全占用（障碍物）
+                # 50 = 安全冗余区域（浅色）
+                # 0 = 自由空间
+                new_occupancy_grid = np.zeros_like(self.occupancy_grid)
+                new_occupancy_grid[safety_margin_mask] = 50  # 安全冗余区域
+                new_occupancy_grid[obstacle_mask] = 100      # 障碍物区域（覆盖冗余区域）
+                
+                self.occupancy_grid = new_occupancy_grid
+                
+            except Exception as e:
+                print(f"Warning: Safety margin generation failed: {e}")
+                # 如果冗余区域生成失败，继续使用现有网格
+    
     def check_auto_save(self):
         """检查是否需要自动保存"""
         current_time = time.time()
@@ -316,6 +430,21 @@ class DroidVisualizer(OrbitDragCameraWindow):
     _2d_eps = 0.1
     _2d_min_samples = 5
     _2d_point_size = 3.0
+
+    # Occupancy Grid配置
+    _enable_occupancy_grid = True
+    _occupancy_grid_resolution = 0.05  # 5cm/pixel
+    _occupancy_point_radius = 0.15  # 每个点周围的占用半径（米）
+    
+    # 形态学操作配置
+    _enable_morphology = True        # 启用形态学操作（腐蚀+膨胀）
+    _erosion_iterations = 1          # 腐蚀迭代次数
+    _dilation_iterations = 1         # 膨胀迭代次数
+    _morphology_kernel_size = 7     # 形态学操作核大小
+    
+    # 冗余区域配置
+    _enable_safety_margin = True     # 启用安全冗余区域
+    _safety_margin_distance = 0.3   # 安全冗余距离（米）
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -447,6 +576,14 @@ class DroidVisualizer(OrbitDragCameraWindow):
             except Exception as e:
                 print(f"Warning: Failed to initialize 2D visualization: {e}")
                 self._enable_2d_plot = False  # 禁用2D可视化以避免后续错误
+
+        # 初始化 Occupancy Grid 可视化
+        if self._enable_occupancy_grid:
+            try:
+                self._init_occupancy_grid_plot()
+            except Exception as e:
+                print(f"Warning: Failed to initialize occupancy grid visualization: {e}")
+                self._enable_occupancy_grid = False
 
     def _init_udp_socket(self):
         """初始化UDP socket用于发送轨迹数据"""
@@ -790,6 +927,145 @@ class DroidVisualizer(OrbitDragCameraWindow):
         except Exception as e:
             print(f"Error updating 2D point cloud: {e}")
 
+    def _init_occupancy_grid_plot(self):
+        """初始化 Occupancy Grid 可视化"""
+        try:
+            # 设置 matplotlib 非阻塞模式
+            plt.ion()
+            
+            # 创建 Occupancy Grid 图
+            self.fig_occupancy = plt.figure(figsize=(10, 10))
+            self.ax_occupancy = self.fig_occupancy.add_subplot(111)
+            self.ax_occupancy.set_title('DROID-SLAM Real-time Occupancy Grid Map', fontsize=14)
+            self.ax_occupancy.set_xlabel('X (m)', fontsize=12)
+            self.ax_occupancy.set_ylabel('Y (m)', fontsize=12)
+            self.ax_occupancy.set_aspect('equal', adjustable='box')
+            
+            # 初始化为空的占用网格图像（将在第一次更新时设置）
+            self.occupancy_image = None
+            
+            # 添加网格
+            self.ax_occupancy.grid(True, alpha=0.3)
+            
+            # 初始化机器人位置点
+            self.robot_position_scatter = self.ax_occupancy.scatter(
+                [], [], s=100, c='red', marker='o', label='Robot Position', zorder=5
+            )
+            
+            self.ax_occupancy.legend()
+            
+            # 初始化统计信息文本
+            self.info_text_occupancy = self.ax_occupancy.text(
+                0.02, 0.98, '', transform=self.ax_occupancy.transAxes, 
+                verticalalignment='top', 
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+            
+            plt.show(block=False)
+            print("Occupancy grid visualization initialized")
+            
+        except Exception as e:
+            print(f"Failed to initialize occupancy grid plot: {e}")
+
+    def _update_occupancy_grid_plot(self, points, robot_position=None):
+        """更新Occupancy Grid可视化（动态范围，仿照2D点云的更新模式）
+        
+        Args:
+            points: 点云数据 (N, 3)，将使用x,y坐标
+            robot_position: 机器人在世界坐标系中的位置 (3,)
+        """
+        try:
+            if not self._enable_occupancy_grid or points is None or len(points) == 0:
+                return
+            
+            # 从点云创建动态occupancy grid
+            self.create_occupancy_grid_from_points(points)
+            
+            # 如果网格还没有创建，退出
+            if self.occupancy_grid is None or self.grid_origin is None:
+                return
+            
+            # 计算网格的世界坐标范围
+            x_extent = [self.grid_origin[0], 
+                       self.grid_origin[0] + self.grid_size[1] * self._occupancy_grid_resolution]
+            y_extent = [self.grid_origin[1], 
+                       self.grid_origin[1] + self.grid_size[0] * self._occupancy_grid_resolution]
+            
+            # 如果这是第一次创建图像或网格尺寸发生变化
+            if (self.occupancy_image is None or 
+                self.occupancy_image.get_array().shape != self.occupancy_grid.shape):
+                
+                # 清除之前的图像
+                if self.occupancy_image is not None:
+                    self.occupancy_image.remove()
+                
+                # 创建新的占用网格图像
+                self.occupancy_image = self.ax_occupancy.imshow(
+                    self.occupancy_grid, 
+                    cmap='RdYlBu_r',  # 使用红-黄-蓝反向色彩映射：红色=障碍物，黄色=冗余区域，蓝色=自由空间
+                    origin='lower',
+                    extent=[x_extent[0], x_extent[1], y_extent[0], y_extent[1]],
+                    vmin=0, vmax=100
+                )
+                
+                # 重新添加colorbar（如果还没有）
+                if not hasattr(self, 'occupancy_colorbar') or self.occupancy_colorbar is None:
+                    self.occupancy_colorbar = plt.colorbar(self.occupancy_image, ax=self.ax_occupancy)
+                    self.occupancy_colorbar.set_label('Occupancy (0=free, 50=safety margin, 100=occupied)', fontsize=12)
+            else:
+                # 更新现有图像的数据和范围
+                self.occupancy_image.set_array(self.occupancy_grid)
+                self.occupancy_image.set_extent([x_extent[0], x_extent[1], y_extent[0], y_extent[1]])
+            
+            # 动态调整坐标轴范围（类似2D点云）
+            margin = 0.5
+            self.ax_occupancy.set_xlim(x_extent[0] - margin, x_extent[1] + margin)
+            self.ax_occupancy.set_ylim(y_extent[0] - margin, y_extent[1] + margin)
+            
+            # 更新机器人位置
+            if robot_position is not None:
+                self.robot_position_scatter.set_offsets([[robot_position[0], robot_position[1]]])
+            
+            # 更新统计信息
+            occupied_cells = np.sum(self.occupancy_grid == 100)      # 完全占用
+            safety_margin_cells = np.sum(self.occupancy_grid == 50)  # 安全冗余区域
+            free_cells = np.sum(self.occupancy_grid == 0)            # 自由空间
+            total_cells = self.occupancy_grid.size
+            
+            occupied_ratio = occupied_cells / total_cells * 100
+            safety_ratio = safety_margin_cells / total_cells * 100
+            free_ratio = free_cells / total_cells * 100
+            
+            info_text = f"Occupied: {occupied_cells} ({occupied_ratio:.1f}%)"
+            info_text += f"\nSafety Margin: {safety_margin_cells} ({safety_ratio:.1f}%)"
+            info_text += f"\nFree: {free_cells} ({free_ratio:.1f}%)"
+            info_text += f"\nTotal: {total_cells}"
+            info_text += f"\nResolution: {self._occupancy_grid_resolution}m/pixel"
+            info_text += f"\nGrid Size: {self.grid_size[1]}x{self.grid_size[0]}"
+            info_text += f"\nCoverage: {self.grid_size[1]*self._occupancy_grid_resolution:.1f}m x {self.grid_size[0]*self._occupancy_grid_resolution:.1f}m"
+            info_text += f"\nPoint Radius: {self._occupancy_point_radius}m"
+            
+            # 添加形态学操作信息
+            if self._enable_morphology:
+                info_text += f"\nMorphology: E{self._erosion_iterations}→D{self._dilation_iterations} (K={self._morphology_kernel_size})"
+            else:
+                info_text += f"\nMorphology: Disabled"
+            
+            # 添加安全冗余区域信息
+            if self._enable_safety_margin:
+                info_text += f"\nSafety Margin: {self._safety_margin_distance}m"
+            else:
+                info_text += f"\nSafety Margin: Disabled"
+            
+            self.info_text_occupancy.set_text(info_text)
+            
+            # 刷新图形
+            self.fig_occupancy.canvas.draw()
+            self.fig_occupancy.canvas.flush_events()
+            
+        except Exception as e:
+            print(f"Error updating occupancy grid plot: {e}")
+
     def on_render(self, time: float, frame_time: float):
         self.ctx.clear(1.0, 1.0, 1.0)
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -886,6 +1162,26 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 except Exception as e:
                     # 2D可视化错误不应该影响主SLAM流程
                     print(f"Warning: 2D visualization update failed: {e}")
+                    pass
+
+            # 更新Occupancy Grid可视化（完全仿照2D点云的调用方式）
+            if self._enable_occupancy_grid:
+                try:
+                    # 直接使用accumulate_point_cloud中处理好的降采样点云数据
+                    current_points = getattr(self, 'current_frame_2d_points', None)
+                    
+                    # 获取当前机器人位置（从最后一个相机位置）
+                    robot_position = None
+                    if cam_pts.shape[0] > 0 and DroidVisualizer._latest_trajectory_data is not None:
+                        latest_pos = DroidVisualizer._latest_trajectory_data.get('latest_position')
+                        if latest_pos:
+                            robot_position = np.array([latest_pos['x'], latest_pos['y'], latest_pos['z']])
+                    
+                    # 更新occupancy grid可视化
+                    self._update_occupancy_grid_plot(current_points, robot_position)
+                except Exception as e:
+                    # Occupancy grid可视化错误不应该影响主SLAM流程
+                    print(f"Warning: Occupancy grid visualization update failed: {e}")
                     pass
 
         self.count += 1
