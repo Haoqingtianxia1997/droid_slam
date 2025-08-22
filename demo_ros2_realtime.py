@@ -18,26 +18,15 @@ from droid import Droid
 from droid_async import DroidAsync
 
 import torch.nn.functional as F
-
-# ROS2 imports
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import PoseStamped, Quaternion, PoseWithCovarianceStamped, TransformStamped
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, Point
+from nav_msgs.msg import Odometry, Path
 from cv_bridge import CvBridge
 import message_filters
-
-# UDP接收相关模块
 import socket
 import json
-
-# 导入UDP接收函数
-from droid_slam.visualizer.droid_visualizer import create_udp_receiver, receive_trajectory_data_udp
-
-# 添加数学计算相关模块
-import math
-
 
 
 def show_image(image):
@@ -67,46 +56,57 @@ class DroidSlamNode(Node):
         self.angle_udp_host = "127.0.0.1"
         self.angle_udp_port = 12347  # 使用不同的端口发送角度数据
         
+        # 路径UDP接收器相关
+        self.path_udp_socket = None
+        self.path_udp_port = 12348
+        self.latest_planned_path = None
+        self.path_lock = threading.Lock()
+        
+        # 全局路径规划相关
+        self.goal_position = None
+        self.goal_lock = threading.Lock()
+        self.path_planning_enabled = False
+        
         # 初始化UDP接收器
         if args.publish_pose:
             self._init_udp_receiver()
             self._init_angle_udp_sender()
+            self._init_path_udp_receiver()
         
         
         # Create pose publishers (only if enabled)
         if args.publish_pose:
             self.pose_pub = self.create_publisher(PoseStamped, 'droid_slam/pose', 1)
             self.odom_pub = self.create_publisher(Odometry, 'droid_slam/odometry', 1)
-            self.first_quat_sub = self.create_subscription(Quaternion, '/robot/root_quaternion', self.first_quat_callback, 1)
-            # TF broadcaster for publishing transform
-            try:
-                from tf2_ros import TransformBroadcaster
-                self.tf_broadcaster = TransformBroadcaster(self)
-                self.publish_tf = True
-                self.get_logger().info("TF broadcaster initialized successfully")
-            except ImportError:
-                self.publish_tf = False
+            
+            # 添加路径发布器
+            self.path_pub = self.create_publisher(Path, '/robot/trajectory', 1)
+            
+            self.pose_sub = self.create_subscription(PoseStamped, '/robot/root_pose', self.pose_callback, 1)
+            self.goal_sub = self.create_subscription(Point, '/goal_position', self.goal_callback, 1)
+            
         else:
             self.pose_pub = None
             self.odom_pub = None
-            self.publish_tf = False
-            self.first_quat_sub = None
-
-        self.quaternion_offset = Quaternion()
-        self.current_angle_with_xy_plane = 0.0  # 存储当前与xy平面的夹角
+            self.path_pub = None
+  
+            self.pose_sub = None
+            self.goal_sub = None
+            
+        self.rgb_sub = message_filters.Subscriber(self, Image, rgb_topic)
+        self.depth_sub = message_filters.Subscriber(self, Image, depth_topic)
         
-        # 存储第一次接收到的四元数用于补偿
-        self.first_quaternion_received = False
-        self.reference_quaternion = None
+        self.ts = message_filters.ApproximateTimeSynchronizer(
+            [self.rgb_sub, self.depth_sub], 
+            queue_size=10, 
+            slop=0.01  
+        )
+        self.ts.registerCallback(self.synchronized_callback)
+        
+        
+        self.pose_isaac = PoseStamped()
         self.quaternion = None
-        self.quaternion_lock = threading.Lock()
-        
-        # 确保第一帧图像和四元数的对应关系
-        self.first_frame_processed = False
-        if args.publish_pose:
-            self.wait_for_quaternion = True  # 等待四元数后再处理第一帧
-        else:
-            self.wait_for_quaternion = False  # 如果不发布pose，直接处理图像
+        self.pose_isaac_lock = threading.Lock()
         
         # Store previous pose for velocity calculation
         self.previous_pose = None
@@ -121,48 +121,95 @@ class DroidSlamNode(Node):
         self.K[1,1] = fy
         self.K[1,2] = cy
         
-        self.rgb_sub = message_filters.Subscriber(self, Image, rgb_topic)
-        self.depth_sub = message_filters.Subscriber(self, Image, depth_topic)
-        
-        self.ts = message_filters.ApproximateTimeSynchronizer(
-            [self.rgb_sub, self.depth_sub], 
-            queue_size=10, 
-            slop=0.01  
-        )
-        self.ts.registerCallback(self.synchronized_callback)
-    
-    def first_quat_callback(self, msg: Quaternion):
-        """处理四元数消息并发送torso相对于世界坐标系的四元数"""
-        with self.quaternion_lock:
-            self.quaternion_offset.w = msg.w
-            self.quaternion_offset.x = msg.x
-            self.quaternion_offset.y = msg.y
-            self.quaternion_offset.z = msg.z
-            
+
+    # Callbacks
+    def pose_callback(self, msg: PoseStamped):
+        """处理位姿消息并发送torso相对于世界坐标系的四元数"""
+        with self.pose_isaac_lock:
+            self.pose_isaac.header.stamp = msg.header.stamp
+            self.pose_isaac.pose.position.x = msg.pose.position.x
+            self.pose_isaac.pose.position.y = msg.pose.position.y
+            self.pose_isaac.pose.position.z = msg.pose.position.z
+            self.pose_isaac.pose.orientation.w = msg.pose.orientation.w
+            self.pose_isaac.pose.orientation.x = msg.pose.orientation.x
+            self.pose_isaac.pose.orientation.y = msg.pose.orientation.y
+            self.pose_isaac.pose.orientation.z = msg.pose.orientation.z
 
             self.quaternion = {
-                'w': msg.w,
-                'x': msg.x,
-                'y': msg.y,
-                'z': msg.z
+                'w': msg.pose.orientation.w,
+                'x': msg.pose.orientation.x,
+                'y': msg.pose.orientation.y,
+                'z': msg.pose.orientation.z
             }
-        # 通过UDP发送第一次接收到的四元数数据（用于补偿）
+
         if self.args.publish_pose and self.angle_udp_socket is not None and self.quaternion is not None:
             quaternion_data = {
                 'torso_to_world_quat': self.quaternion,
                 'timestamp': self.idx
             }
             self.idx += 1
-            if self.idx > 0:
-                self.first_quaternion_received = True
-                self.wait_for_quaternion = False
             self._send_angle_data_udp(quaternion_data)
         
+    def goal_callback(self, msg: Point):
+        """处理目标位置消息"""
+        with self.goal_lock:
+            self.goal_position = [msg.x, msg.y, msg.z]
+            self.path_planning_enabled = True
+            
+        self.get_logger().info(f"Received goal position: [{msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f}]")
+        
+        # 通过UDP发送目标位置到可视化器进行路径规划
+        if self.args.publish_pose and self.angle_udp_socket is not None:
+            goal_data = {
+                'goal_position': {
+                    'x': msg.x,
+                    'y': msg.y,
+                    'z': msg.z
+                },
+                'type': 'goal_position',
+                'timestamp': time.time()
+            }
+            self._send_angle_data_udp(goal_data)
 
+    def synchronized_callback(self, rgb_msg, depth_msg):
+            
+        # Convert ROS message to OpenCV format
+        rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
+        depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
+
+        # Process image data
+        processed_data = self.process_frame(rgb_image, depth_image)
+        
+        if processed_data is not None:
+            t, image_tensor, depth_tensor, intrinsics = processed_data
+            
+            # Show image if visualization is enabled
+            if not self.args.disable_vis:
+                show_image(image_tensor[0])
+
+            # Initialize DROID (on first frame)
+            if self.droid is None:
+                self.args.image_size = [image_tensor.shape[2], image_tensor.shape[3]]
+                self.droid = DroidAsync(self.args) if self.args.asynchronous else Droid(self.args)
+
+            # Track current frame
+            self.droid.track(t, image_tensor, depth=depth_tensor, intrinsics=intrinsics)
+
+            # Publish camera pose after tracking (with a small delay to ensure processing is complete)
+            self.publish_camera_pose(rgb_msg.header.stamp)
+            
+            # Publish planned path if available
+            self.publish_planned_path(rgb_msg.header.stamp)
+
+        else:
+            self.get_logger().warning('process_frame returned None')
+        
+
+    # UDP Configuration
     def _init_udp_receiver(self):
         """初始化UDP接收器"""
         try:
-            self.udp_socket = create_udp_receiver(host="127.0.0.1", port=12346, timeout=0.001)
+            self.udp_socket = self.create_udp_receiver(host="127.0.0.1", port=12346, timeout=0.001)
             if self.udp_socket:
                 # 启动UDP接收线程
                 self.udp_thread = threading.Thread(target=self._udp_receiver_thread, daemon=True)
@@ -180,6 +227,23 @@ class DroidSlamNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to initialize angle UDP sender: {e}")
             self.angle_udp_socket = None
+    
+    def _init_path_udp_receiver(self):
+        """初始化路径UDP接收器"""
+        try:
+            self.path_udp_socket = self.create_udp_receiver(
+                host="127.0.0.1", 
+                port=self.path_udp_port, 
+                timeout=0.001
+            )
+            if self.path_udp_socket:
+                # 启动路径UDP接收线程
+                self.path_udp_thread = threading.Thread(target=self._path_udp_receiver_thread, daemon=True)
+                self.path_udp_thread.start()
+                self.get_logger().info(f"Path UDP receiver thread started on port {self.path_udp_port}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to initialize path UDP receiver: {e}")
+            self.path_udp_socket = None
     
     def _send_angle_data_udp(self, angle_data):
         """通过UDP发送角度数据"""
@@ -202,7 +266,7 @@ class DroidSlamNode(Node):
         while rclpy.ok():
             try:
                 if self.udp_socket:
-                    trajectory_data = receive_trajectory_data_udp(self.udp_socket)
+                    trajectory_data = self.receive_trajectory_data_udp(self.udp_socket)
                     if trajectory_data:
                         with self.trajectory_lock:
                             self.latest_trajectory_data = trajectory_data
@@ -211,7 +275,65 @@ class DroidSlamNode(Node):
                 # self.get_logger().error(f"Error in UDP receiver thread: {e}")
                 pass
             time.sleep(0.001)  # 小延迟避免CPU占用过高
-  
+    
+    def _path_udp_receiver_thread(self):
+        """路径UDP接收线程"""
+        while rclpy.ok():
+            try:
+                if self.path_udp_socket:
+                    path_data = self.receive_path_data_udp(self.path_udp_socket)
+                    if path_data:
+                        with self.path_lock:
+                            self.latest_planned_path = path_data
+                        self.get_logger().info(f"Received planned path with {len(path_data.get('path', []))} waypoints")
+            except Exception as e:
+                # self.get_logger().error(f"Error in path UDP receiver thread: {e}")
+                pass
+            time.sleep(0.001)  # 小延迟避免CPU占用过高
+
+    def create_udp_receiver(self,host="127.0.0.1", port=12345, timeout=1.0):
+        """创建UDP接收器用于接收轨迹数据"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((host, port))
+            sock.settimeout(timeout)
+            print(f"UDP receiver created and listening on {host}:{port}")
+            return sock
+        except Exception as e:
+            print(f"Failed to create UDP receiver: {e}")
+            return None
+
+    def receive_trajectory_data_udp(self, sock):
+        """从UDP接收轨迹数据"""
+        try:
+            data, addr = sock.recvfrom(65536)  # 64KB buffer
+            json_data = data.decode('utf-8')
+            trajectory_data = json.loads(json_data)
+            return trajectory_data
+        except socket.timeout:
+            return None
+        except Exception as e:
+            print(f"Failed to receive trajectory data via UDP: {e}")
+            return None
+    
+    def receive_path_data_udp(self, sock):
+        """从UDP接收路径规划数据"""
+        try:
+            data, addr = sock.recvfrom(65536)  # 64KB buffer
+            json_data = data.decode('utf-8')
+            path_data = json.loads(json_data)
+            # 验证数据类型
+            if path_data.get('type') == 'planned_path':
+                return path_data
+            else:
+                return None
+        except socket.timeout:
+            return None
+        except Exception as e:
+            print(f"Failed to receive path data via UDP: {e}")
+            return None
+
+    # Publisher
     def publish_camera_pose(self, stamp):
   
         if not self.args.publish_pose:
@@ -234,6 +356,16 @@ class DroidSlamNode(Node):
             pose_msg.pose.position.x = float(latest_pos[0])  
             pose_msg.pose.position.y = float(latest_pos[1])  
             pose_msg.pose.position.z = float(latest_pos[2])  
+            if self.quaternion is not None:
+                pose_msg.pose.orientation.w = self.quaternion['w']
+                pose_msg.pose.orientation.x = self.quaternion['x']
+                pose_msg.pose.orientation.y = self.quaternion['y']
+                pose_msg.pose.orientation.z = self.quaternion['z']
+            else:
+                pose_msg.pose.orientation.w = 1.0
+                pose_msg.pose.orientation.x = 0.0
+                pose_msg.pose.orientation.y = 0.0
+                pose_msg.pose.orientation.z = 0.0
             
             self.pose_pub.publish(pose_msg)
             
@@ -262,50 +394,41 @@ class DroidSlamNode(Node):
             self.previous_pose = latest_pos.copy()
             self.previous_time = current_time      
     
-   
-    def synchronized_callback(self, rgb_msg, depth_msg):
-        # 如果启用了pose发布且还在等待第一个四元数，则跳过图像处理
-        if self.args.publish_pose and self.wait_for_quaternion:
-            self.get_logger().info("Waiting for first quaternion before processing images...")
+    def publish_planned_path(self, stamp):
+        """发布规划的路径"""
+        if self.path_pub is None:
             return
-            
-        # Convert ROS message to OpenCV format
-        rgb_image = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-        depth_image = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
-
-        # Process image data
-        processed_data = self.process_frame(rgb_image, depth_image)
         
-        if processed_data is not None:
-            t, image_tensor, depth_tensor, intrinsics = processed_data
+        path_data = None
+        with self.path_lock:
+            path_data = self.latest_planned_path
             
-            # 记录第一帧处理
-            if not self.first_frame_processed:
-                with self.quaternion_lock:
-                    if self.first_quaternion_received:
-                        self.first_frame_processed = True
-                        self.get_logger().info(f"First frame processed (frame {t}) with reference quaternion established")
-                    else:
-                        self.get_logger().warning("Processing first frame but quaternion not yet received")
+        if path_data is not None and 'path' in path_data:
+            path_msg = Path()
+            path_msg.header.stamp = stamp
+            path_msg.header.frame_id = self.args.map_frame_id
             
-            # Show image if visualization is enabled
-            if not self.args.disable_vis:
-                show_image(image_tensor[0])
-
-            # Initialize DROID (on first frame)
-            if self.droid is None:
-                self.args.image_size = [image_tensor.shape[2], image_tensor.shape[3]]
-                self.droid = DroidAsync(self.args) if self.args.asynchronous else Droid(self.args)
-
-            # Track current frame
-            self.droid.track(t, image_tensor, depth=depth_tensor, intrinsics=intrinsics)
-
-            # Publish camera pose after tracking (with a small delay to ensure processing is complete)
-            self.publish_camera_pose(rgb_msg.header.stamp)
-
-        else:
-            self.get_logger().warning('process_frame returned None')
-
+            for waypoint in path_data['path']:
+                pose_stamped = PoseStamped()
+                pose_stamped.header.stamp = stamp
+                pose_stamped.header.frame_id = self.args.map_frame_id
+                
+                # waypoint是[x, y]格式，z设为0
+                pose_stamped.pose.position.x = float(waypoint[0])
+                pose_stamped.pose.position.y = float(waypoint[1])
+                pose_stamped.pose.position.z = 0.0
+                
+                # 设置默认朝向
+                pose_stamped.pose.orientation.w = 1.0
+                pose_stamped.pose.orientation.x = 0.0
+                pose_stamped.pose.orientation.y = 0.0
+                pose_stamped.pose.orientation.z = 0.0
+                
+                path_msg.poses.append(pose_stamped)
+            
+            self.path_pub.publish(path_msg)
+            self.get_logger().info(f"Published planned path with {len(path_msg.poses)} waypoints")
+    
     def process_frame(self, rgb_image, depth_image):
         """Process RGB and depth images, returning the format needed by DROID-SLAM"""
         
@@ -365,6 +488,20 @@ class DroidSlamNode(Node):
             except Exception as e:
                 self.get_logger().error(f'Error closing angle UDP socket: {str(e)}')
         
+        # 关闭路径UDP socket
+        if self.path_udp_socket:
+            try:
+                self.path_udp_socket.close()
+                self.get_logger().info('Path UDP socket closed')
+            except Exception as e:
+                self.get_logger().error(f'Error closing path UDP socket: {str(e)}')
+        
+        # 清理目标位置
+        if hasattr(self, 'goal_lock'):
+            with self.goal_lock:
+                self.goal_position = None
+                self.path_planning_enabled = False
+        
         if self.droid is not None:
             self.get_logger().info('Terminating DROID-SLAM...')
             # Note: Since this is a real-time stream, we cannot pass image_stream to terminate
@@ -377,6 +514,7 @@ class DroidSlamNode(Node):
                 self.get_logger().error(f'Error terminating DROID-SLAM: {str(e)}')
                 return None
         return None
+
 
 def save_reconstruction(droid, save_path):
     """Save reconstruction results"""
@@ -438,6 +576,11 @@ def main():
     parser.add_argument("--publish_pose", action="store_true", help="enable pose publishing to ROS topics")
     parser.add_argument("--camera_frame_id", type=str, default="camera_link", help="frame ID for camera in TF tree")
     parser.add_argument("--map_frame_id", type=str, default="map", help="frame ID for map/world coordinate system")
+    
+    # 全局路径规划说明:
+    # 启用 --publish_pose 参数后，系统会订阅 /goal_position (geometry_msgs/Point) 话题
+    # 发送目标位置命令: ros2 topic pub /goal_position geometry_msgs/Point "x: 2.0, y: 3.0, z: 0.0"
+    # 路径会自动在占用栅格地图中显示为蓝色，目标点为紫色
 
     args = parser.parse_args()
 

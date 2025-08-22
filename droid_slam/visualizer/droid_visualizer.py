@@ -28,6 +28,10 @@ from sklearn.cluster import DBSCAN
 # 添加形态学操作
 from scipy.ndimage import binary_erosion, binary_dilation
 
+# 添加路径规划相关
+import heapq
+from typing import List, Tuple, Optional
+
 # 添加UDP传输相关模块
 import socket
 import json
@@ -134,6 +138,9 @@ class DroidVisualizer(OrbitDragCameraWindow):
         # Frontier探索相关变量
         self.explored_grid = None   # 已探索区域网格
         self.current_exploration_sector = None  # 当前帧的探索扇形区域
+        
+        # 路径规划相关变量
+        self.latest_robot_position = None  # 最新的机器人位置
     
     def accumulate_point_cloud(self):
         """累积当前帧的点云数据"""
@@ -304,6 +311,10 @@ class DroidVisualizer(OrbitDragCameraWindow):
         """
         if points is None or len(points) == 0:
             return
+        
+        # 保存机器人位置用于路径规划
+        if robot_position is not None:
+            self.latest_robot_position = robot_position
         
         # 使用静态网格范围或动态计算范围
         if self._use_static_grid_range:
@@ -605,6 +616,19 @@ class DroidVisualizer(OrbitDragCameraWindow):
             
             self.occupancy_grid = final_grid
             
+            # 如果启用了路径规划且有目标位置，尝试进行路径规划
+            if (DroidVisualizer._path_planning_enabled and 
+                DroidVisualizer._goal_position is not None and 
+                hasattr(self, 'latest_robot_position') and 
+                self.latest_robot_position is not None):
+                #calculate distance
+                distance = self.heuristic(self.latest_robot_position, DroidVisualizer._goal_position)
+                if distance > DroidVisualizer._path_planning_distance_threshold:
+                    self.plan_global_path(self.latest_robot_position)
+                    self._visualize_path_in_grid()
+                else:
+                    DroidVisualizer._path_planning_enabled = False
+
         except Exception as e:
             print(f"Warning: Failed to merge exploration layers: {e}")
     
@@ -614,6 +638,184 @@ class DroidVisualizer(OrbitDragCameraWindow):
         if current_time - self.last_save_time >= self.save_interval:
             self.save_accumulated_point_cloud()
             self.last_save_time = current_time
+    
+    def world_to_grid(self, world_pos: List[float]) -> Tuple[int, int]:
+        """世界坐标转网格坐标"""
+        if self.grid_origin is None:
+            return None, None
+        grid_x = int((world_pos[0] - self.grid_origin[0]) / self._occupancy_grid_resolution)
+        grid_y = int((world_pos[1] - self.grid_origin[1]) / self._occupancy_grid_resolution)
+        return grid_x, grid_y
+    
+    def grid_to_world(self, grid_pos: Tuple[int, int]) -> List[float]:
+        """网格坐标转世界坐标"""
+        if self.grid_origin is None:
+            return [0, 0]
+        world_x = self.grid_origin[0] + grid_pos[0] * self._occupancy_grid_resolution
+        world_y = self.grid_origin[1] + grid_pos[1] * self._occupancy_grid_resolution
+        return [world_x, world_y]
+    
+    def is_valid_grid_pos(self, pos: Tuple[int, int]) -> bool:
+        """检查网格位置是否有效"""
+        x, y = pos
+        if self.grid_size is None:
+            return False
+        return 0 <= x < self.grid_size[1] and 0 <= y < self.grid_size[0]
+    
+    def is_free_space(self, grid_pos: Tuple[int, int]) -> bool:
+        """检查网格位置是否为自由空间"""
+        if not self.is_valid_grid_pos(grid_pos) or self.occupancy_grid is None:
+            return False
+        x, y = grid_pos
+        # 只有已探索的自由区域(25)和当前探索区域(75)才被认为是可通行的
+        return self.occupancy_grid[y, x] in [25, 75]
+    
+    def get_neighbors(self, pos: Tuple[int, int]) -> List[Tuple[Tuple[int, int], float]]:
+        """获取8邻域的可通行邻居节点和对应的移动代价"""
+        x, y = pos
+        neighbors = []
+        
+        # 8邻域方向
+        directions = [
+            (-1, -1, 1.414), (-1, 0, 1.0), (-1, 1, 1.414),
+            (0, -1, 1.0),                    (0, 1, 1.0),
+            (1, -1, 1.414),  (1, 0, 1.0),   (1, 1, 1.414)
+        ]
+        
+        for dx, dy, cost in directions:
+            new_pos = (x + dx, y + dy)
+            if self.is_free_space(new_pos):
+                neighbors.append((new_pos, cost))
+        
+        return neighbors
+    
+    def heuristic(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        """A*算法的启发式函数（欧几里得距离）"""
+        return ((a[0] - b[0])**2 + (a[1] - b[1])**2)**0.5
+    
+    def astar_path_planning(self, start_world: List[float], goal_world: List[float]) -> Optional[List[List[float]]]:
+        """A*路径规划算法
+        
+        Args:
+            start_world: 起始点世界坐标 [x, y]
+            goal_world: 目标点世界坐标 [x, y]
+            
+        Returns:
+            路径点列表（世界坐标），如果无路径则返回None
+        """
+        if self.occupancy_grid is None or self.grid_origin is None:
+            return None
+        
+        # 转换为网格坐标
+        start_grid = self.world_to_grid(start_world)
+        goal_grid = self.world_to_grid(goal_world)
+        
+        if start_grid[0] is None or goal_grid[0] is None:
+            return None
+        
+        # 检查起点和终点是否有效
+        if not self.is_free_space(start_grid):
+            print(f"Start position {start_world} is not in free space")
+            return None
+        
+        if not self.is_free_space(goal_grid):
+            print(f"Goal position {goal_world} is not in free space")
+            return None
+        
+        # A*算法主体
+        open_set = []
+        heapq.heappush(open_set, (0, start_grid))
+        
+        came_from = {}
+        g_score = {start_grid: 0}
+        f_score = {start_grid: self.heuristic(start_grid, goal_grid)}
+        
+        while open_set:
+            current = heapq.heappop(open_set)[1]
+            
+            if current == goal_grid:
+                # 重建路径
+                path_grid = []
+                while current in came_from:
+                    path_grid.append(current)
+                    current = came_from[current]
+                path_grid.append(start_grid)
+                path_grid.reverse()
+                
+                # 转换为世界坐标
+                path_world = [self.grid_to_world(pos) for pos in path_grid]
+                return path_world
+            
+            for neighbor, move_cost in self.get_neighbors(current):
+                tentative_g_score = g_score[current] + move_cost
+                
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = g_score[neighbor] + self.heuristic(neighbor, goal_grid)
+                    
+                    if neighbor not in [item[1] for item in open_set]:
+                        heapq.heappush(open_set, (f_score[neighbor], neighbor))
+        
+        return None  # 无路径
+    
+    def plan_global_path(self, robot_position: List[float]) -> Optional[List[List[float]]]:
+        """执行全局路径规划"""
+        if not DroidVisualizer._path_planning_enabled or DroidVisualizer._goal_position is None:
+            return None
+        
+        try:
+            path = self.astar_path_planning(
+                start_world=[robot_position[0], robot_position[1]], 
+                goal_world=[DroidVisualizer._goal_position[0], DroidVisualizer._goal_position[1]]
+            )
+            
+            if path is not None:
+                DroidVisualizer._planned_path = path
+                print(f"Global path planned successfully with {len(path)} waypoints")
+                
+                # 通过UDP发送路径数据到ROS2节点
+                self._send_planned_path_udp(path)
+            else:
+                print("Failed to find a valid path to goal")
+                DroidVisualizer._planned_path = None
+            
+            return path
+        except Exception as e:
+            print(f"Error in path planning: {e}")
+            return None
+    
+    def _visualize_path_in_grid(self):
+        """在占用栅格中可视化规划的路径"""
+        if (DroidVisualizer._planned_path is None or 
+            self.occupancy_grid is None or 
+            self.grid_origin is None):
+            return
+        
+        try:
+            # 在占用栅格上标记路径（使用值200表示路径）
+            for point in DroidVisualizer._planned_path:
+                grid_x, grid_y = self.world_to_grid(point)
+                if grid_x is not None and self.is_valid_grid_pos((grid_x, grid_y)):
+                    # 只在自由空间中显示路径
+                    if self.occupancy_grid[grid_y, grid_x] in [25, 75]:  # 自由区域
+                        self.occupancy_grid[grid_y, grid_x] = 200  # 路径标记
+            
+            # 标记目标位置（使用值250）
+            if DroidVisualizer._goal_position is not None:
+                goal_grid = self.world_to_grid([DroidVisualizer._goal_position[0], DroidVisualizer._goal_position[1]])
+                if goal_grid[0] is not None and self.is_valid_grid_pos(goal_grid):
+                    # 在目标位置周围绘制一个小圆圈
+                    gx, gy = goal_grid
+                    for dy in range(-2, 3):
+                        for dx in range(-2, 3):
+                            if dx*dx + dy*dy <= 4:  # 圆形区域
+                                nx, ny = gx + dx, gy + dy
+                                if self.is_valid_grid_pos((nx, ny)):
+                                    self.occupancy_grid[ny, nx] = 250  # 目标标记
+                    
+        except Exception as e:
+            print(f"Error visualizing path: {e}")
     title = "Droid Visualizer"
     _depth_video1 = None
     _depth_video2 = None
@@ -637,6 +839,12 @@ class DroidVisualizer(OrbitDragCameraWindow):
     _first_angle_data = None
     _first_recieved_angle_data = False
     
+    # 全局路径规划相关
+    _goal_position = None
+    _planned_path = None
+    _path_planning_enabled = False
+    _path_planning_distance_threshold = 1.2  # 默认值为1.2米
+
     # 2D点云实时可视化配置
     _enable_2d_plot = True
     _2d_filter_outliers = False
@@ -653,16 +861,16 @@ class DroidVisualizer(OrbitDragCameraWindow):
     _enable_morphology = True        # 启用形态学操作（腐蚀+膨胀）
     _erosion_iterations = 1          # 腐蚀迭代次数
     _dilation_iterations = 1         # 膨胀迭代次数
-    _morphology_kernel_size = 7     # 形态学操作核大小
+    _morphology_kernel_size = 6     # 形态学操作核大小
     
     # 冗余区域配置
     _enable_safety_margin = True     # 启用安全冗余区域
-    _safety_margin_distance = 0.3   # 安全冗余距离（米）
+    _safety_margin_distance = 1.0   # 安全冗余距离（米）
     
     # Frontier探索配置
     _enable_frontier_exploration = True  # 启用frontier探索功能
     _exploration_sector_angle = 60       # 探索扇形角度（度）
-    _exploration_sector_radius = 5.0     # 探索扇形半径（米）
+    _exploration_sector_radius = 7.0     # 探索扇形半径（米）
     _exploration_ray_resolution = 0.02   # 射线分辨率（角度）
     
     # 静态网格范围配置
@@ -844,13 +1052,22 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 if DroidVisualizer._angle_udp_socket:
                     data, addr = DroidVisualizer._angle_udp_socket.recvfrom(1024)
                     json_data = data.decode('utf-8')
-                    quaternion_data = json.loads(json_data)
-        
-                    if  not DroidVisualizer._first_recieved_angle_data:
-                        DroidVisualizer._first_angle_data = quaternion_data
-                        DroidVisualizer._first_recieved_angle_data = True
-                        
-                    DroidVisualizer._latest_angle_data = quaternion_data
+                    received_data = json.loads(json_data)
+                    
+                    # 处理不同类型的数据
+                    if 'type' in received_data and received_data['type'] == 'goal_position':
+                        # 处理目标位置数据
+                        goal_pos = received_data['goal_position']
+                        DroidVisualizer._goal_position = [goal_pos['x'], goal_pos['y'], goal_pos['z']]
+                        DroidVisualizer._path_planning_enabled = True
+                        print(f"Received goal position for path planning: {DroidVisualizer._goal_position}")
+                    else:
+                        # 处理四元数数据
+                        if not DroidVisualizer._first_recieved_angle_data:
+                            DroidVisualizer._first_angle_data = received_data
+                            DroidVisualizer._first_recieved_angle_data = True
+                            
+                        DroidVisualizer._latest_angle_data = received_data
             except socket.timeout:
                 pass
             except Exception as e:
@@ -873,6 +1090,32 @@ class DroidVisualizer(OrbitDragCameraWindow):
 
         except Exception as e:
             print(f"Failed to send trajectory data via UDP: {e}")
+    
+    def _send_planned_path_udp(self, path):
+        """通过UDP发送规划路径数据到ROS2节点"""
+        if DroidVisualizer._udp_socket is None:
+            return
+            
+        try:
+            # 构建路径数据包
+            path_data = {
+                'type': 'planned_path',
+                'path': path,  # 路径点列表，每个点是[x, y]格式
+                'timestamp': time.time(),
+                'path_length': len(path)
+            }
+            
+            # 将数据序列化为JSON
+            json_data = json.dumps(path_data)
+            data_bytes = json_data.encode('utf-8')
+            
+            # 发送数据到新的端口(12348)用于路径传输
+            path_udp_port = 12348
+            DroidVisualizer._udp_socket.sendto(data_bytes, (DroidVisualizer._udp_host, path_udp_port))
+            print(f"Sent planned path via UDP with {len(path)} waypoints to port {path_udp_port}")
+
+        except Exception as e:
+            print(f"Failed to send planned path via UDP: {e}")
 
     def _init_3d_trajectory_plot(self):
         """初始化 3D 轨迹可视化"""
@@ -1244,12 +1487,14 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 # 50: 安全冗余区域 - 黄色  
                 # 75: 当前探索扇形区域 - 绿色
                 # 100: 障碍物 - 红色
-                colors = ['black', 'white', 'yellow', 'lightgreen', 'red']
-                values = [0, 25, 50, 75, 100]
+                # 200: 规划路径 - 蓝色
+                # 250: 目标位置 - 紫色
+                colors = ['black', 'white', 'yellow', 'lightgreen', 'red', 'blue', 'magenta']
+                values = [0, 25, 50, 75, 100, 200, 250]
                 
                 # 创建自定义颜色映射
                 cmap = mcolors.ListedColormap(colors)
-                norm = mcolors.BoundaryNorm([-0.5, 12.5, 37.5, 62.5, 87.5, 100.5], cmap.N)
+                norm = mcolors.BoundaryNorm([-0.5, 12.5, 37.5, 62.5, 87.5, 150, 225, 250.5], cmap.N)
                 
                 # 创建新的占用网格图像
                 self.occupancy_image = self.ax_occupancy.imshow(
@@ -1266,17 +1511,14 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 if not hasattr(self, 'occupancy_colorbar') or self.occupancy_colorbar is None:
                     self.occupancy_colorbar = plt.colorbar(
                         self.occupancy_image, ax=self.ax_occupancy,
-                        ticks=[0, 25, 50, 75, 100],
+                        ticks=[0, 25, 50, 75, 100, 200, 250],
                         format='%d'
                     )
-                    # self.occupancy_colorbar.set_label(
-                    #     'Occupancy\n0=Frontier(Black), 25=Explored(White), 50=Safety(Yellow), 75=Current(Green), 100=Occupied(Red)', 
-                    #     fontsize=10
-                    # )
-                    # 设置colorbar标签
+                    # 设置颜色条标签
                     self.occupancy_colorbar.ax.set_yticklabels([
-                        'Frontier', 'Explored', 'Safety', 'Current', 'Occupied'
+                        'Frontier', 'Explored', 'Safety', 'Current', 'Occupied', 'Path', 'Goal'
                     ])
+
             else:
                 # 更新现有图像的数据和范围
                 self.occupancy_image.set_array(self.occupancy_grid)
@@ -1507,27 +1749,3 @@ def visualization_fn(depth_video1, depth_video2):
             except Exception as e:
                 print(f"Error closing angle UDP socket: {e}")
 
-def create_udp_receiver(host="127.0.0.1", port=12345, timeout=1.0):
-    """创建UDP接收器用于接收轨迹数据"""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((host, port))
-        sock.settimeout(timeout)
-        print(f"UDP receiver created and listening on {host}:{port}")
-        return sock
-    except Exception as e:
-        print(f"Failed to create UDP receiver: {e}")
-        return None
-
-def receive_trajectory_data_udp(sock):
-    """从UDP接收轨迹数据"""
-    try:
-        data, addr = sock.recvfrom(65536)  # 64KB buffer
-        json_data = data.decode('utf-8')
-        trajectory_data = json.loads(json_data)
-        return trajectory_data
-    except socket.timeout:
-        return None
-    except Exception as e:
-        print(f"Failed to receive trajectory data via UDP: {e}")
-        return None
