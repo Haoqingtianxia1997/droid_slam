@@ -83,8 +83,8 @@ class DroidSlamNode(Node):
             self.path_pub = self.create_publisher(Path, '/robot/trajectory', 1)
             
             self.pose_sub = self.create_subscription(PoseStamped, '/robot/root_pose', self.pose_callback, 1)
-            self.goal_sub = self.create_subscription(Point, '/goal_position', self.goal_callback, 1)
-            
+            self.goal_sub = self.create_subscription(PoseStamped, '/goal_position', self.goal_callback, 1)
+
         else:
             self.pose_pub = None
             self.odom_pub = None
@@ -150,21 +150,21 @@ class DroidSlamNode(Node):
             self.idx += 1
             self._send_angle_data_udp(quaternion_data)
         
-    def goal_callback(self, msg: Point):
+    def goal_callback(self, msg: PoseStamped):
         """处理目标位置消息"""
         with self.goal_lock:
-            self.goal_position = [msg.x, msg.y, msg.z]
+            self.goal_position = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
             self.path_planning_enabled = True
-            
-        self.get_logger().info(f"Received goal position: [{msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f}]")
-        
+
+        self.get_logger().info(f"Received goal position: [{msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}, {msg.pose.position.z:.2f}]")
+
         # 通过UDP发送目标位置到可视化器进行路径规划
         if self.args.publish_pose and self.angle_udp_socket is not None:
             goal_data = {
                 'goal_position': {
-                    'x': msg.x,
-                    'y': msg.y,
-                    'z': msg.z
+                    'x': msg.pose.position.x,
+                    'y': msg.pose.position.y,
+                    'z': msg.pose.position.z
                 },
                 'type': 'goal_position',
                 'timestamp': time.time()

@@ -693,8 +693,118 @@ class DroidVisualizer(OrbitDragCameraWindow):
         """A*算法的启发式函数（欧几里得距离）"""
         return ((a[0] - b[0])**2 + (a[1] - b[1])**2)**0.5
     
+    # def find_nearest_free_space(self, grid_pos: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    #     """寻找距离指定网格位置最近的自由空间点
+        
+    #     使用BFS广度优先搜索，保证找到距离最近的自由空间点。
+    #     搜索会遍历整个栅格地图直到找到自由空间为止。
+        
+    #     Args:
+    #         grid_pos: 目标网格位置 (x, y)
+            
+    #     Returns:
+    #         最近的自由空间点的网格坐标，如果整个地图都没有自由空间则返回None
+    #     """
+    #     if self.occupancy_grid is None:
+    #         return None
+            
+    #     x, y = grid_pos
+        
+    #     # 如果当前位置已经是自由空间，直接返回
+    #     if self.is_free_space(grid_pos):
+    #         return grid_pos
+            
+    #     # 记录当前位置的占用类型
+    #     if self.is_valid_grid_pos(grid_pos):
+    #         occupancy_value = self.occupancy_grid[y, x]
+    #         if occupancy_value == 100:
+    #             print(f"Position ({x}, {y}) is in obstacle area, searching for nearest free space...")
+    #         elif occupancy_value == 50:
+    #             print(f"Position ({x}, {y}) is in safety margin area, searching for nearest free space...")
+    #         elif occupancy_value == 0:
+    #             print(f"Position ({x}, {y}) is in unexplored area, searching for nearest free space...")
+    #         else:
+    #             print(f"Position ({x}, {y}) has occupancy value {occupancy_value}, searching for nearest free space...")
+            
+    #     # 使用BFS搜索最近的自由空间，不设置搜索半径限制
+    #     from collections import deque
+        
+    #     queue = deque([(x, y, 0)])  # (x, y, distance)
+    #     visited = set()
+    #     visited.add((x, y))
+        
+    #     # 8邻域方向，按距离优先排序
+    #     directions = [
+    #         (-1, 0), (1, 0), (0, -1), (0, 1),  # 4-邻域优先
+    #         (-1, -1), (-1, 1), (1, -1), (1, 1)  # 对角邻域
+    #     ]
+        
+    #     while queue:
+    #         curr_x, curr_y, distance = queue.popleft()
+            
+    #         # 检查8邻域
+    #         for dx, dy in directions:
+    #             new_x, new_y = curr_x + dx, curr_y + dy
+    #             new_pos = (new_x, new_y)
+                
+    #             if new_pos in visited:
+    #                 continue
+                    
+    #             if not self.is_valid_grid_pos(new_pos):
+    #                 continue
+                    
+    #             visited.add(new_pos)
+                
+    #             # 如果找到自由空间，返回该位置
+    #             if self.is_free_space(new_pos):
+    #                 world_pos = self.grid_to_world(new_pos)
+    #                 print(f"Found nearest free space at grid ({new_x}, {new_y}), world ({world_pos[0]:.2f}, {world_pos[1]:.2f}), distance {distance + 1} cells")
+    #                 return new_pos
+                    
+    #             # 继续搜索：允许通过未探索区域(0)和安全区域(50)，但不通过障碍物(100)
+    #             # 这样可以绕过障碍物寻找自由空间
+    #             occupancy_val = self.occupancy_grid[new_y, new_x]
+    #             if occupancy_val != 100:  # 不是障碍物
+    #                 queue.append((new_x, new_y, distance + 1))
+        
+    #     print(f"Warning: No free space found in the entire occupancy grid from position ({x}, {y})")
+    #     return None
+    def find_nearest_free_space(self, grid_pos):
+        """返回离 grid_pos 最近的 free 单元（只考虑 free==25 或 75）。
+        不考虑可达性；若整图无 free 返回 None。
+        """
+        if self.occupancy_grid is None or not self.is_valid_grid_pos(grid_pos):
+            return None
+
+        x0, y0 = grid_pos
+
+        # 你定义的 free：25=Explored、75=Current（如只要 25，把 75 删掉）
+        free_mask = (self.occupancy_grid == 25) | (self.occupancy_grid == 75)
+
+        # 已经在 free 上，直接返回
+        if free_mask[y0, x0]:
+            return (x0, y0)
+
+        ys, xs = np.where(free_mask)
+        if xs.size == 0:
+            return None  # 全图没有 free
+
+        # 计算到所有 free 单元的平方距离并取最小
+        d2 = (xs - x0) ** 2 + (ys - y0) ** 2
+        i = int(np.argmin(d2))
+        return (int(xs[i]), int(ys[i]))
+
     def astar_path_planning(self, start_world: List[float], goal_world: List[float]) -> Optional[List[List[float]]]:
-        """A*路径规划算法
+        """A*路径规划算法，自动处理起点/终点在非自由空间的情况
+        
+        当起点或终点在以下区域时，会自动寻找最近的自由空间点作为替代：
+        - 障碍物区域 (值为100)
+        - 安全冗余区域 (值为50) 
+        - 未探索区域 (值为0)
+        - 其他非自由区域
+        
+        只有已探索的自由区域(25)和当前探索区域(75)被认为是可规划的自由空间。
+        寻找替代点时会搜索整个栅格地图，保证找到最近的自由空间点。
         
         Args:
             start_world: 起始点世界坐标 [x, y]
@@ -713,14 +823,43 @@ class DroidVisualizer(OrbitDragCameraWindow):
         if start_grid[0] is None or goal_grid[0] is None:
             return None
         
-        # 检查起点和终点是否有效
-        if not self.is_free_space(start_grid):
-            print(f"Start position {start_world} is not in free space")
-            return None
+        # 记录原始起点和终点（用于日志输出和最终路径构建）
+        original_start_grid = start_grid
+        original_goal_grid = goal_grid
+        original_start_world = start_world.copy()
+        original_goal_world = goal_world.copy()
         
+        # 检查起点是否在自由空间，如果不是（包括未探索区域）则寻找最近的自由空间点
+        if not self.is_free_space(start_grid):
+            print(f"Start position {start_world} (grid: {start_grid}) is not in free space (value: {self.occupancy_grid[start_grid[1], start_grid[0]]})")
+            
+            # 寻找最近的自由空间点作为新起点
+            new_start_grid = self.find_nearest_free_space(start_grid)
+            if new_start_grid is None:
+                print("Cannot find a valid free space near start position for path planning")
+                return None
+                
+            start_grid = new_start_grid
+            start_world = self.grid_to_world(start_grid)
+            print(f"Using nearest free space as start: {start_world} (grid: {start_grid})")
+        
+        # 检查终点是否在自由空间，如果不是（包括未探索区域）则寻找最近的自由空间点  
         if not self.is_free_space(goal_grid):
-            print(f"Goal position {goal_world} is not in free space")
-            return None
+            print(f"Goal position {goal_world} (grid: {goal_grid}) is not in free space (value: {self.occupancy_grid[goal_grid[1], goal_grid[0]]})")
+            
+            # 寻找最近的自由空间点作为新终点
+            new_goal_grid = self.find_nearest_free_space(goal_grid)
+            if new_goal_grid is None:
+                print("Cannot find a valid free space near goal position for path planning")
+                return None
+                
+            goal_grid = new_goal_grid
+            goal_world = self.grid_to_world(goal_grid)
+            print(f"Using nearest free space as goal: {goal_world} (grid: {goal_grid})")
+        
+        # 如果起点和终点相同，返回单点路径
+        if start_grid == goal_grid:
+            return [start_world, goal_world] if start_world != goal_world else [start_world]
         
         # A*算法主体
         open_set = []
@@ -744,6 +883,18 @@ class DroidVisualizer(OrbitDragCameraWindow):
                 
                 # 转换为世界坐标
                 path_world = [self.grid_to_world(pos) for pos in path_grid]
+                
+                # 如果使用了替代起点，在路径开头添加原始起点
+                if original_start_grid != start_grid:
+                    path_world.insert(0, original_start_world)
+                    print(f"Added original start point {original_start_world} to path beginning")
+                
+                # 如果使用了替代终点，在路径结尾添加原始终点
+                if original_goal_grid != goal_grid:
+                    path_world.append(original_goal_world)
+                    print(f"Added original goal point {original_goal_world} to path end")
+                    
+                print(f"A* path planning completed with {len(path_world)} waypoints")
                 return path_world
             
             for neighbor, move_cost in self.get_neighbors(current):
@@ -757,7 +908,9 @@ class DroidVisualizer(OrbitDragCameraWindow):
                     if neighbor not in [item[1] for item in open_set]:
                         heapq.heappush(open_set, (f_score[neighbor], neighbor))
         
-        return None  # 无路径
+        return None  # 无路径找到
+        
+        print("A* path planning failed: no path found between start and goal positions")
     
     def plan_global_path(self, robot_position: List[float]) -> Optional[List[List[float]]]:
         """执行全局路径规划"""
@@ -843,7 +996,7 @@ class DroidVisualizer(OrbitDragCameraWindow):
     _goal_position = None
     _planned_path = None
     _path_planning_enabled = False
-    _path_planning_distance_threshold = 1.2  # 默认值为1.2米
+    _path_planning_distance_threshold = 2.0  # 默认值为2.0米
 
     # 2D点云实时可视化配置
     _enable_2d_plot = True
