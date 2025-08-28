@@ -46,28 +46,28 @@ class DroidSlamNode(Node):
         
         self.idx = 0
         
-        # UDP接收器相关
+        # UDP receiver
         self.udp_socket = None
         self.latest_trajectory_data = None
         self.trajectory_lock = threading.Lock()
-        
-        # UDP发送器相关（用于发送角度数据）
+
+        # UDP sender (for sending angle data)
         self.angle_udp_socket = None
         self.angle_udp_host = "127.0.0.1"
-        self.angle_udp_port = 12347  # 使用不同的端口发送角度数据
-        
-        # 路径UDP接收器相关
+        self.angle_udp_port = 12347  # Use a different port for sending angle data
+
+        # Path UDP receiver
         self.path_udp_socket = None
         self.path_udp_port = 12348
         self.latest_planned_path = None
         self.path_lock = threading.Lock()
-        
-        # 全局路径规划相关
+
+        # Global path planning related
         self.goal_position = None
         self.goal_lock = threading.Lock()
         self.path_planning_enabled = False
-        
-        # 初始化UDP接收器
+
+        # Initialize UDP receiver
         if args.publish_pose:
             self._init_udp_receiver()
             self._init_angle_udp_sender()
@@ -78,8 +78,8 @@ class DroidSlamNode(Node):
         if args.publish_pose:
             self.pose_pub = self.create_publisher(PoseStamped, 'droid_slam/pose', 1)
             self.odom_pub = self.create_publisher(Odometry, 'droid_slam/odometry', 1)
-            
-            # 添加路径发布器
+
+            # Add path publisher
             self.path_pub = self.create_publisher(Path, '/robot/trajectory', 1)
             
             self.pose_sub = self.create_subscription(PoseStamped, '/robot/root_pose', self.pose_callback, 1)
@@ -124,7 +124,7 @@ class DroidSlamNode(Node):
 
     # Callbacks
     def pose_callback(self, msg: PoseStamped):
-        """处理位姿消息并发送torso相对于世界坐标系的四元数"""
+        """Process pose messages and send torso-to-world quaternion"""
         with self.pose_isaac_lock:
             self.pose_isaac.header.stamp = msg.header.stamp
             self.pose_isaac.pose.position.x = msg.pose.position.x
@@ -151,14 +151,14 @@ class DroidSlamNode(Node):
             self._send_angle_data_udp(quaternion_data)
         
     def goal_callback(self, msg: PoseStamped):
-        """处理目标位置消息"""
+        """Process goal position messages for path planning"""
         with self.goal_lock:
             self.goal_position = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
             self.path_planning_enabled = True
 
         self.get_logger().info(f"Received goal position: [{msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}, {msg.pose.position.z:.2f}]")
 
-        # 通过UDP发送目标位置到可视化器进行路径规划
+        # Send goal position to visualizer for path planning via UDP
         if self.args.publish_pose and self.angle_udp_socket is not None:
             goal_data = {
                 'goal_position': {
@@ -207,11 +207,11 @@ class DroidSlamNode(Node):
 
     # UDP Configuration
     def _init_udp_receiver(self):
-        """初始化UDP接收器"""
+        """Initialize UDP receiver"""
         try:
             self.udp_socket = self.create_udp_receiver(host="127.0.0.1", port=12346, timeout=0.001)
             if self.udp_socket:
-                # 启动UDP接收线程
+                # Start UDP receiver thread
                 self.udp_thread = threading.Thread(target=self._udp_receiver_thread, daemon=True)
                 self.udp_thread.start()
                 self.get_logger().info("UDP receiver thread started")
@@ -220,7 +220,7 @@ class DroidSlamNode(Node):
             self.udp_socket = None
     
     def _init_angle_udp_sender(self):
-        """初始化UDP发送器用于发送角度数据"""
+        """Initialize UDP sender for sending angle data"""
         try:
             self.angle_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.get_logger().info("Angle UDP sender initialized")
@@ -229,7 +229,7 @@ class DroidSlamNode(Node):
             self.angle_udp_socket = None
     
     def _init_path_udp_receiver(self):
-        """初始化路径UDP接收器"""
+        """Initialize path UDP receiver"""
         try:
             self.path_udp_socket = self.create_udp_receiver(
                 host="127.0.0.1", 
@@ -237,7 +237,7 @@ class DroidSlamNode(Node):
                 timeout=0.001
             )
             if self.path_udp_socket:
-                # 启动路径UDP接收线程
+                # Start path UDP receiver thread
                 self.path_udp_thread = threading.Thread(target=self._path_udp_receiver_thread, daemon=True)
                 self.path_udp_thread.start()
                 self.get_logger().info(f"Path UDP receiver thread started on port {self.path_udp_port}")
@@ -246,23 +246,23 @@ class DroidSlamNode(Node):
             self.path_udp_socket = None
     
     def _send_angle_data_udp(self, angle_data):
-        """通过UDP发送角度数据"""
+        """Send angle data via UDP"""
         if self.angle_udp_socket is None:
             return
             
         try:
-            # 将角度数据序列化为JSON
+            # Serialize angle data to JSON
             json_data = json.dumps(angle_data)
             data_bytes = json_data.encode('utf-8')
-            
-            # 发送数据
+
+            # Send data
             self.angle_udp_socket.sendto(data_bytes, (self.angle_udp_host, self.angle_udp_port))
             
         except Exception as e:
             self.get_logger().error(f"Failed to send angle data via UDP: {e}")
     
     def _udp_receiver_thread(self):
-        """UDP接收线程"""
+        """UDP receiver thread"""
         while rclpy.ok():
             try:
                 if self.udp_socket:
@@ -274,10 +274,10 @@ class DroidSlamNode(Node):
             except Exception as e:
                 # self.get_logger().error(f"Error in UDP receiver thread: {e}")
                 pass
-            time.sleep(0.001)  # 小延迟避免CPU占用过高
-    
+            time.sleep(0.001)  # Small delay to avoid high CPU usage
+
     def _path_udp_receiver_thread(self):
-        """路径UDP接收线程"""
+        """Path UDP receiver thread"""
         while rclpy.ok():
             try:
                 if self.path_udp_socket:
@@ -289,10 +289,10 @@ class DroidSlamNode(Node):
             except Exception as e:
                 # self.get_logger().error(f"Error in path UDP receiver thread: {e}")
                 pass
-            time.sleep(0.001)  # 小延迟避免CPU占用过高
+            time.sleep(0.001)  # Small delay to avoid high CPU usage
 
     def create_udp_receiver(self,host="127.0.0.1", port=12345, timeout=1.0):
-        """创建UDP接收器用于接收轨迹数据"""
+        """Create UDP receiver for receiving trajectory data"""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind((host, port))
@@ -304,7 +304,7 @@ class DroidSlamNode(Node):
             return None
 
     def receive_trajectory_data_udp(self, sock):
-        """从UDP接收轨迹数据"""
+        """Receive trajectory data from UDP"""
         try:
             data, addr = sock.recvfrom(65536)  # 64KB buffer
             json_data = data.decode('utf-8')
@@ -317,12 +317,12 @@ class DroidSlamNode(Node):
             return None
     
     def receive_path_data_udp(self, sock):
-        """从UDP接收路径规划数据"""
+        """Receive path planning data from UDP"""
         try:
             data, addr = sock.recvfrom(65536)  # 64KB buffer
             json_data = data.decode('utf-8')
             path_data = json.loads(json_data)
-            # 验证数据类型
+            # Validate data type
             if path_data.get('type') == 'planned_path':
                 return path_data
             else:
@@ -395,7 +395,7 @@ class DroidSlamNode(Node):
             self.previous_time = current_time      
     
     def publish_planned_path(self, stamp):
-        """发布规划的路径"""
+        """Publish planned path"""
         if self.path_pub is None:
             return
         
@@ -412,13 +412,13 @@ class DroidSlamNode(Node):
                 pose_stamped = PoseStamped()
                 pose_stamped.header.stamp = stamp
                 pose_stamped.header.frame_id = self.args.map_frame_id
-                
-                # waypoint是[x, y]格式，z设为0
+
+                # waypoint is [x, y] format, z is set to 0
                 pose_stamped.pose.position.x = float(waypoint[0])
                 pose_stamped.pose.position.y = float(waypoint[1])
                 pose_stamped.pose.position.z = 0.0
-                
-                # 设置默认朝向
+
+                # Set default orientation
                 pose_stamped.pose.orientation.w = 1.0
                 pose_stamped.pose.orientation.x = 0.0
                 pose_stamped.pose.orientation.y = 0.0
@@ -472,31 +472,31 @@ class DroidSlamNode(Node):
 
     def terminate_slam(self):
         """Terminate SLAM and save results"""
-        # 关闭UDP socket
+        # Close UDP socket
         if self.udp_socket:
             try:
                 self.udp_socket.close()
                 self.get_logger().info('UDP socket closed')
             except Exception as e:
                 self.get_logger().error(f'Error closing UDP socket: {str(e)}')
-        
-        # 关闭角度UDP socket
+
+        # Close angle UDP socket
         if self.angle_udp_socket:
             try:
                 self.angle_udp_socket.close()
                 self.get_logger().info('Angle UDP socket closed')
             except Exception as e:
                 self.get_logger().error(f'Error closing angle UDP socket: {str(e)}')
-        
-        # 关闭路径UDP socket
+
+        # Close path UDP socket
         if self.path_udp_socket:
             try:
                 self.path_udp_socket.close()
                 self.get_logger().info('Path UDP socket closed')
             except Exception as e:
                 self.get_logger().error(f'Error closing path UDP socket: {str(e)}')
-        
-        # 清理目标位置
+
+        # Clean up goal position
         if hasattr(self, 'goal_lock'):
             with self.goal_lock:
                 self.goal_position = None
@@ -576,11 +576,11 @@ def main():
     parser.add_argument("--publish_pose", action="store_true", help="enable pose publishing to ROS topics")
     parser.add_argument("--camera_frame_id", type=str, default="camera_link", help="frame ID for camera in TF tree")
     parser.add_argument("--map_frame_id", type=str, default="map", help="frame ID for map/world coordinate system")
-    
-    # 全局路径规划说明:
-    # 启用 --publish_pose 参数后，系统会订阅 /goal_position (geometry_msgs/Point) 话题
-    # 发送目标位置命令: ros2 topic pub /goal_position geometry_msgs/Point "x: 2.0, y: 3.0, z: 0.0"
-    # 路径会自动在占用栅格地图中显示为蓝色，目标点为紫色
+
+    # Global path planning instructions:
+    # After enabling the --publish_pose parameter, the system will subscribe to the /goal_position (geometry_msgs/Point) topic
+    # Send goal position command: ros2 topic pub /goal_position geometry_msgs/Point "x: 2.0, y: 3.0, z: 0.0"
+    # The path will automatically be displayed in blue on the occupied grid map, with the goal point in purple
 
     args = parser.parse_args()
 
